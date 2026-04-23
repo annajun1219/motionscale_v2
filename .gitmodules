@@ -1,0 +1,12 @@
+[submodule "preproc/Pi3"]
+	path = preproc/Pi3
+	url = https://github.com/yyfz/Pi3.git
+[submodule "preproc/sam2"]
+	path = preproc/sam2
+	url = https://github.com/facebookresearch/sam2.git
+[submodule "preproc/co-tracker"]
+	path = preproc/co-tracker
+	url = https://github.com/hrzhou2/co-tracker.git
+[submodule "preproc/mega-sam"]
+	path = preproc/mega-sam
+	url = https://github.com/hrzhou2/mega-sam.git

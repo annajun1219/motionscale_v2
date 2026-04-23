@@ -1,0 +1,5 @@
+pillow
+trimesh
+plyfile
+huggingface_hub
+safetensors

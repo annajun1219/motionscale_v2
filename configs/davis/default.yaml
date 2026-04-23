@@ -1,0 +1,13 @@
+# Base config
+work_dir: 'outputs/davis/'
+dataset: 'davis'
+data_dir: '/path/to/DAVIS/'
+
+# Data config
+data:
+  mask_type: "sam2_masks"
+  depth_type: "megasam"
+  camera_type: "megasam"
+  slam_type: "megasam/outputs_cvd"
+  track_2d_type: "cotracker3"
+  shadow_type: "sam2_shadows"

@@ -1,0 +1,28 @@
+viser==0.2.23
+opencv-python
+imageio
+imageio-ffmpeg
+matplotlib
+gradio
+tensorboard
+scikit-learn
+jaxtyping
+roma
+ninja
+pytorch-msssim
+loguru
+tyro
+mediapy
+open3d
+numpy==1.26.4
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0
+torchvision==0.21.0
+ipdb
+nerfview==0.0.3
+torchmetrics
+splines==0.3.2
+tqdm
+pyyaml
+--extra-index-url https://pypi.nvidia.com
+cuml-cu12==24.6.*

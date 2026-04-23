@@ -1,0 +1,17 @@
+*.pth
+*.npy
+*.mp4
+*.log
+*.ply
+test.py
+outputs/
+work_dirs/
+*__pycache__*
+.vscode/
+.envrc
+.bak/
+datasets/
+preproc/checkpoints/
+.idea/
+.claude/
+run.sh
