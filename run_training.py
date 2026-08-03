@@ -17,10 +17,6 @@ import open3d as o3d
 from flow3d.configs import TrainConfig
 from flow3d.data import (
     BaseDataset,
-    CasualDataset,
-    CasualDatasetVideoView,
-    MultiViewCasualDataset,
-    MultiViewDavisDataConfig,
     get_train_val_datasets,
 )
 from flow3d.data.base_dataset import CustomBatchSampler, CustomSequentialSampler
@@ -103,25 +99,9 @@ def main():
 
     ## Data Preparation
     # Load datasets
-    extra_view_datasets: dict[str, CasualDataset] = {}
-    if cfg.multiview_extra_cams:
-        primary_seq_name = f"{cfg.data.seq_name}_multiview"
-        mv_cfg = MultiViewDavisDataConfig(
-            seq_names={"primary": primary_seq_name, **{c: c for c in cfg.multiview_extra_cams}},
-            root_dir=cfg.data.root_dir,
-            primary_view="primary",
-            mask_erosion_radius=cfg.data.mask_erosion_radius,
-        )
-        guru.info(f"Multi-view training: primary={primary_seq_name}, extra={cfg.multiview_extra_cams}")
-        mv_dataset = MultiViewCasualDataset(mv_cfg)
-        train_dataset = mv_dataset.get_view("primary")
-        train_video_view = CasualDatasetVideoView(train_dataset)
-        val_img_dataset, val_kpt_dataset = None, None
-        extra_view_datasets = {v: ds for v, ds in mv_dataset.datasets.items() if v != "primary"}
-    else:
-        train_dataset, train_video_view, val_img_dataset, val_kpt_dataset = (
-            get_train_val_datasets(cfg.data, load_val=True)
-        )
+    train_dataset, train_video_view, val_img_dataset, val_kpt_dataset = (
+        get_train_val_datasets(cfg.data, load_val=True)
+    )
     guru.info(f"Training dataset has {train_dataset.num_frames} frames")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -147,7 +127,6 @@ def main():
         port=cfg.port,
         checkpoint_every=cfg.optim.checkpoint_every_steps,
     )
-    trainer.extra_view_datasets = extra_view_datasets
 
     custom_batch_sampler = CustomBatchSampler(
         ranges=[(0, cfg.num_init_frames, 0, cfg.num_init_frames)],

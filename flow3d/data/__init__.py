@@ -4,7 +4,6 @@ from torch.utils.data import Dataset
 
 from .base_dataset import BaseDataset
 from .casual_dataset import CasualDataset, CasualDatasetVideoView, CustomDataConfig, DavisDataConfig
-from .multiview_dataset import MultiViewCasualDataset, MultiViewDavisDataConfig
 
 
 DATASET_REGISTRY = {

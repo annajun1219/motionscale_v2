@@ -93,9 +93,6 @@ class LossesConfig:
     w_center_coarse: float = 1.0
     w_coarse_align: float = 0.1
     use_log_scale_var: bool = True
-    # Overall multiplier on the photometric-only loss from extra (non-primary)
-    # multi-view cameras, see TrainConfig.multiview_extra_cams.
-    w_multiview: float = 1.0
 
 
 @dataclass
@@ -192,14 +189,6 @@ class TrainConfig:
     eval_every: int = 10
     eval_last_n_epochs: int = 100
     prop_fg_only: bool = False
-
-    # Extra camera seq_names (e.g. ["dog_cam08", "dog_cam17", "dog_cam26"]) to
-    # supervise from in addition to the primary --seq_name view. Requires
-    # <seq_name>_multiview + these seq_names to already be preprocessed with
-    # camera_type="static_rig", depth_type="moge_calib" (see
-    # preproc/prepare_diva360_multiview.py). None (default) = today's
-    # single-view training, unchanged.
-    multiview_extra_cams: list[str] | None = None
 
     @classmethod
     def build_from_cli(cls) -> "TrainConfig":
