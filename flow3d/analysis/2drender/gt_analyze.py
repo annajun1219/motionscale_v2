@@ -1,44 +1,48 @@
 #!/usr/bin/env python3
 """
-Compare novel-view renders against real DiVa-360 photographs.
+Compare novel-view renders against real DyCheck photographs.
 
 Input
 -----
-The PNGs written by flow3d/analysis/2drender/render_output_novelview.py:
-    <novel-views-dir>/<ref_cam>_frame<NNNN>_ref.png
-    <novel-views-dir>/<cam>_angle<AA.A>_frame<NNNN>.png
+The outputs of flow3d/analysis/2drender/render_output_novelview.py:
+    <novel-views-dir>/selection_summary.json
+    <novel-views-dir>/<view>_frame<NNNN>.png (+ camera0_frame<NNNN>_ref.png)
 
 Output
 ------
 <output-dir>/
     gt_comparison_all.csv          (one row per render/GT pair)
-    gt_comparison_cam_summary.csv  (metrics averaged per camera)
+    gt_comparison_cam_summary.csv  (metrics averaged per view)
     analysis_report.json
     comparisons/<stem>_compare.png (render | GT | abs-diff side by side)
     plots/psnr_by_cam.png, plots/ssim_by_cam.png
 
-IMPORTANT CAVEAT -- read before trusting the novel-camera numbers
-------------------------------------------------------------------
-For the reference camera (--ref-cam, e.g. cam00), the render uses the exact
-pose the model was trained and evaluated with, so its metrics measure
-genuine reconstruction fidelity (in-distribution).
+IMPORTANT CAVEAT -- read before trusting the camera1/camera2 numbers
+----------------------------------------------------------------------
+For the reference camera (camera0), the render uses the exact pose the model
+was trained and evaluated with, so its metrics measure genuine reconstruction
+fidelity (in-distribution).
 
-For every OTHER camera, render_output_novelview.py can only *approximate*
-the real camera: it transplants DiVa-360's real relative rotation onto the
-trained scene, but keeps the reference camera's own intrinsics and an
-approximate orbit radius, because the trained (mega-sam) coordinate frame
-has no known metric scale relating it to DiVa-360's real camera positions.
-So a large pixel error against a novel camera's real photo can mean either
-(a) genuinely poor novel-view reconstruction, or (b) a real but imperfect
-viewpoint/FOV match -- this script cannot tell the two apart. Treat the
-reference-camera row as the trustworthy quality signal, and the novel-camera
-rows as a rough, pessimistically-biased indicator (misalignment inflates
-the error on top of whatever the reconstruction itself gets wrong).
+camera1 and camera2 are real, physically-captured DyCheck cameras that were
+never used for training, so they have real ground-truth photos -- but
+render_output_novelview.py can only *approximate* their pose: it transplants
+DyCheck's real relative rotation (camera0 -> camera1/camera2) onto the
+trained scene, keeping camera0's own intrinsics and an approximate orbit
+radius, because the trained (mega-sam) coordinate frame has no known metric
+scale relating it to DyCheck's real camera positions. So a large pixel error
+against camera1/camera2's real photo can mean either (a) genuinely poor
+novel-view reconstruction, or (b) a real but imperfect viewpoint/FOV match --
+this script cannot tell the two apart. Treat the camera0 row as the
+trustworthy quality signal, and camera1/camera2 as a rough,
+pessimistically-biased indicator.
+
+novel1/novel2/novel3 are purely synthetic viewpoints with no corresponding
+physical camera, so they have no ground truth and are always skipped here.
 
 Example
 -------
     python flow3d/analysis/2drender/gt_analyze.py \\
-        --work-dir outputs/davis/dog_cam00/2026_07_26_03_03_54__dog_cam00_run3
+        --work-dir outputs/davis/spin/2026_08_03_08_41_11__spin_run1
 """
 
 from __future__ import annotations
@@ -46,7 +50,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -67,8 +70,13 @@ from PIL import Image
 from flow3d.data.casual_dataset import CasualDataset, DavisDataConfig
 from flow3d.metrics import mLPIPS, mPSNR, mSSIM, compute_psnr
 
-REF_PATTERN = re.compile(r"^(?P<cam>[a-zA-Z0-9]+)_frame(?P<frame>\d+)_ref\.png$")
-NOVEL_PATTERN = re.compile(r"^(?P<cam>[a-zA-Z0-9]+)_angle(?P<angle>[-+]?\d+\.\d+)_frame(?P<frame>\d+)\.png$")
+# Real, physically-captured DyCheck cameras that have ground truth but were
+# never used for training. novel1/novel2/novel3 are synthetic and have none.
+REAL_DYCHECK_VIEWS = ["camera1", "camera2"]
+
+# data/DAVIS/JPEGImages/480p/<seq>/ keeps every 3rd camera0 frame from
+# data/DyCheck/<seq>/rgb/1x/ -- must match render_output_novelview.py.
+DYCHECK_SUBSAMPLE_INTERVAL = 3
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -81,13 +89,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Default: <work-dir>/novel_views",
     )
     parser.add_argument(
-        "--diva-dir", type=Path, default=Path("data/DiVa360/processed_data/dog"),
-        help="DiVa-360 sequence dir. GT for non-reference cameras is read from "
-             "<diva-dir>/image/<cam>/<frame_name>.jpg.",
+        "--dycheck-dir", type=Path, default=Path("data/DyCheck/spin"),
+        help="DyCheck sequence dir. GT for camera1/camera2 is read from "
+             "<dycheck-dir>/rgb/1x/<cam_id>_<NNNNN>.png.",
     )
-    parser.add_argument("--config", type=Path, default=Path("configs/davis/default.yaml"))
-    parser.add_argument("--seq-name", type=str, default="dog_cam00")
-    parser.add_argument("--ref-cam", type=str, default="cam00")
+    parser.add_argument("--config", type=Path, default=Path("configs/davis/spin.yaml"))
+    parser.add_argument("--seq-name", type=str, default="spin")
+    parser.add_argument("--ref-view", type=str, default="camera0")
     parser.add_argument(
         "--output-dir", type=Path, default=None,
         help="Default: <work-dir>/analysis/gt_comparison",
@@ -108,33 +116,32 @@ def load_dataset(config_path: Path, seq_name: str) -> CasualDataset:
     return CasualDataset(**asdict(data_cfg))
 
 
-def parse_render_filename(path: Path, ref_cam: str) -> dict[str, Any] | None:
-    match = REF_PATTERN.match(path.name)
-    if match is not None:
-        return {
-            "cam": match.group("cam"),
-            "frame_idx": int(match.group("frame")),
-            "angle_deg": 0.0,
-            "is_ref": match.group("cam") == ref_cam,
-        }
-    match = NOVEL_PATTERN.match(path.name)
-    if match is not None:
-        return {
-            "cam": match.group("cam"),
-            "frame_idx": int(match.group("frame")),
-            "angle_deg": float(match.group("angle")),
-            "is_ref": False,
-        }
-    return None
+def load_render_entries(novel_views_dir: Path) -> list[dict[str, Any]]:
+    """Read render_output_novelview.py's selection_summary.json (view/frame/file per render)."""
+    summary_path = novel_views_dir / "selection_summary.json"
+    if not summary_path.is_file():
+        raise FileNotFoundError(
+            f"{summary_path} not found. Run render_output_novelview.py first "
+            "(this script reads its selection_summary.json, not filenames directly)."
+        )
+    summary = json.loads(summary_path.read_text())
+    return summary["views"]
 
 
-def find_gt_path(cam: str, frame_name: str, ref_cam: str, ref_img_dir: Path, diva_dir: Path) -> Path | None:
-    if cam == ref_cam:
-        candidates = [ref_img_dir / f"{frame_name}{ext}" for ext in (".jpg", ".jpeg", ".png")]
-    else:
-        cam_dir = diva_dir / "image" / cam
-        candidates = [cam_dir / f"{frame_name}{ext}" for ext in (".jpg", ".jpeg", ".png")]
-    for candidate in candidates:
+def find_gt_path(
+    view: str, frame_idx: int, ref_view: str, ref_img_dir: Path, dycheck_dir: Path
+) -> Path | None:
+    if view == ref_view:
+        # Handled by the caller via dataset.frame_names; kept here for symmetry.
+        return None
+    if view not in REAL_DYCHECK_VIEWS:
+        # novel1/novel2/novel3: synthetic viewpoints, no physical camera exists there.
+        return None
+    cam_id = view.replace("camera", "")
+    orig_idx = frame_idx * DYCHECK_SUBSAMPLE_INTERVAL
+    cam_dir = dycheck_dir / "rgb" / "1x"
+    for ext in (".png", ".jpg", ".jpeg"):
+        candidate = cam_dir / f"{cam_id}_{orig_idx:05d}{ext}"
         if candidate.is_file():
             return candidate
     return None
@@ -166,19 +173,19 @@ def save_comparison_image(path: Path, render: np.ndarray, gt: np.ndarray, title:
 def save_bar_plot(rows: list[dict[str, Any]], value_key: str, ylabel: str, output_path: Path) -> None:
     if not rows:
         return
-    cams = sorted({row["cam"] for row in rows}, key=lambda c: (c != rows[0]["ref_cam"], c))
+    views = sorted({row["view"] for row in rows}, key=lambda c: (c != rows[0]["ref_view"], c))
     means = []
-    is_ref_by_cam = {}
-    for cam in cams:
-        values = [row[value_key] for row in rows if row["cam"] == cam and np.isfinite(row[value_key])]
+    is_ref_by_view = {}
+    for view in views:
+        values = [row[value_key] for row in rows if row["view"] == view and np.isfinite(row[value_key])]
         means.append(float(np.mean(values)) if values else float("nan"))
-        is_ref_by_cam[cam] = any(row["is_ref"] for row in rows if row["cam"] == cam)
+        is_ref_by_view[view] = any(row["is_ref"] for row in rows if row["view"] == view)
 
-    colors = ["tab:orange" if is_ref_by_cam[cam] else "tab:blue" for cam in cams]
-    plt.figure(figsize=(max(6, len(cams) * 1.2), 4.5))
-    plt.bar(cams, means, color=colors)
+    colors = ["tab:orange" if is_ref_by_view[view] else "tab:blue" for view in views]
+    plt.figure(figsize=(max(6, len(views) * 1.2), 4.5))
+    plt.bar(views, means, color=colors)
     plt.ylabel(ylabel)
-    plt.title(f"{ylabel} by camera (orange = reference / in-distribution)")
+    plt.title(f"{ylabel} by view (orange = reference / in-distribution)")
     plt.xticks(rotation=30, ha="right")
     plt.tight_layout()
     plt.savefig(output_path, dpi=160)
@@ -208,8 +215,8 @@ def main() -> None:
 
     if not novel_views_dir.is_dir():
         raise FileNotFoundError(f"Novel-views dir not found: {novel_views_dir}")
-    if not args.diva_dir.is_dir():
-        raise FileNotFoundError(f"DiVa-360 sequence dir not found: {args.diva_dir}")
+    if not args.dycheck_dir.is_dir():
+        raise FileNotFoundError(f"DyCheck sequence dir not found: {args.dycheck_dir}")
 
     device_name = args.device
     if device_name.startswith("cuda") and not torch.cuda.is_available():
@@ -220,36 +227,47 @@ def main() -> None:
     dataset = load_dataset(args.config, args.seq_name)
     ref_img_dir = Path(dataset.img_dir)
 
-    render_paths = sorted(novel_views_dir.glob("*.png"))
-    parsed = [(path, parse_render_filename(path, args.ref_cam)) for path in render_paths]
-    unparsed = [path for path, info in parsed if info is None]
-    if unparsed:
-        print(f"[Warning] Skipping {len(unparsed)} file(s) with unrecognized name pattern.")
-    entries = [(path, info) for path, info in parsed if info is not None]
+    entries = load_render_entries(novel_views_dir)
     if not entries:
-        raise RuntimeError(f"No render_output_novelview.py outputs found in {novel_views_dir}.")
+        raise RuntimeError(f"No renders listed in {novel_views_dir}/selection_summary.json.")
 
     ssim_metric = mSSIM().to(device)
     lpips_metric = mLPIPS(net_type=args.lpips_net).to(device)
 
     rows: list[dict[str, Any]] = []
     missing_gt: list[str] = []
+    skipped_synthetic = 0
 
-    for path, info in entries:
-        cam, frame_idx, angle_deg, is_ref = (
-            info["cam"], info["frame_idx"], info["angle_deg"], info["is_ref"]
-        )
+    for entry in entries:
+        view = entry["view"]
+        frame_idx = entry["frame_idx"]
+        is_ref = entry.get("is_ref", view == args.ref_view)
+        render_path = novel_views_dir / entry["file"]
+        if not render_path.is_file():
+            print(f"[Warning] {render_path} listed in summary but missing on disk, skipping.")
+            continue
         if not (0 <= frame_idx < len(dataset.frame_names)):
-            print(f"[Warning] {path.name}: frame_idx {frame_idx} out of dataset range, skipping.")
+            print(f"[Warning] {render_path.name}: frame_idx {frame_idx} out of dataset range, skipping.")
             continue
         frame_name = dataset.frame_names[frame_idx]
 
-        gt_path = find_gt_path(cam, frame_name, args.ref_cam, ref_img_dir, args.diva_dir)
-        if gt_path is None:
-            missing_gt.append(f"{cam}/{frame_name}")
+        if is_ref:
+            gt_path = next(
+                (ref_img_dir / f"{frame_name}{ext}" for ext in (".jpg", ".jpeg", ".png")
+                 if (ref_img_dir / f"{frame_name}{ext}").is_file()),
+                None,
+            )
+        elif view in REAL_DYCHECK_VIEWS:
+            gt_path = find_gt_path(view, frame_idx, args.ref_view, ref_img_dir, args.dycheck_dir)
+        else:
+            skipped_synthetic += 1
             continue
 
-        render = load_image_float(path)
+        if gt_path is None:
+            missing_gt.append(f"{view}/{frame_name}")
+            continue
+
+        render = load_image_float(render_path)
         gt = load_image_float(gt_path)
         if render.shape != gt.shape:
             gt_img = Image.fromarray((gt * 255).astype(np.uint8)).resize(
@@ -273,10 +291,11 @@ def main() -> None:
         lpips = float(lpips_metric.compute().item())
 
         row = {
-            "cam": cam,
-            "ref_cam": args.ref_cam,
+            "view": view,
+            "ref_view": args.ref_view,
             "is_ref": is_ref,
-            "angle_deg": angle_deg,
+            "azimuth_deg": entry.get("azimuth_deg", float("nan")),
+            "elevation_deg": entry.get("elevation_deg", float("nan")),
             "frame_idx": frame_idx,
             "frame_name": frame_name,
             "mae": mae,
@@ -284,27 +303,29 @@ def main() -> None:
             "psnr": psnr,
             "ssim": ssim,
             "lpips": lpips,
-            "render_path": str(path),
+            "render_path": str(render_path),
             "gt_path": str(gt_path),
             "comparison_path": "",
         }
 
         if not args.metrics_only:
-            compare_path = comparisons_dir / f"{path.stem}_compare.png"
-            kind = "reference (in-distribution)" if is_ref else f"novel (~{angle_deg:.1f} deg)"
+            compare_path = comparisons_dir / f"{render_path.stem}_compare.png"
+            kind = "reference (in-distribution)" if is_ref else f"real GT (az={row['azimuth_deg']:.1f} deg)"
             save_comparison_image(
                 compare_path, render, gt,
-                title=f"{cam} frame {frame_name} [{kind}]  "
+                title=f"{view} frame {frame_name} [{kind}]  "
                       f"PSNR={psnr:.2f} SSIM={ssim:.3f} LPIPS={lpips:.3f}",
             )
             row["comparison_path"] = str(compare_path)
 
         rows.append(row)
         print(
-            f"{cam} frame={frame_name} {'REF' if is_ref else f'novel({angle_deg:+.1f}deg)'} "
+            f"{view} frame={frame_name} {'REF' if is_ref else 'real-GT'} "
             f"psnr={psnr:.2f} ssim={ssim:.3f} lpips={lpips:.3f} mae={mae:.4f}"
         )
 
+    if skipped_synthetic:
+        print(f"[Info] Skipped {skipped_synthetic} synthetic-view render(s) (novel1/2/3 have no GT).")
     if missing_gt:
         print(f"[Warning] No GT image found for {len(missing_gt)} render(s): {missing_gt[:10]}"
               + (" ..." if len(missing_gt) > 10 else ""))
@@ -316,51 +337,54 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-    cams = sorted({row["cam"] for row in rows}, key=lambda c: (c != args.ref_cam, c))
-    cam_summary = []
-    for cam in cams:
-        cam_rows = [row for row in rows if row["cam"] == cam]
-        cam_summary.append({
-            "cam": cam,
-            "is_ref": cam_rows[0]["is_ref"],
-            "angle_deg": cam_rows[0]["angle_deg"],
-            "num_frames": len(cam_rows),
-            "mean_mae": float(np.mean([r["mae"] for r in cam_rows])),
-            "mean_mse": float(np.mean([r["mse"] for r in cam_rows])),
-            "mean_psnr": float(np.mean([r["psnr"] for r in cam_rows])),
-            "mean_ssim": float(np.mean([r["ssim"] for r in cam_rows])),
-            "mean_lpips": float(np.mean([r["lpips"] for r in cam_rows])),
+    views = sorted({row["view"] for row in rows}, key=lambda c: (c != args.ref_view, c))
+    view_summary = []
+    for view in views:
+        view_rows = [row for row in rows if row["view"] == view]
+        view_summary.append({
+            "view": view,
+            "is_ref": view_rows[0]["is_ref"],
+            "azimuth_deg": view_rows[0]["azimuth_deg"],
+            "elevation_deg": view_rows[0]["elevation_deg"],
+            "num_frames": len(view_rows),
+            "mean_mae": float(np.mean([r["mae"] for r in view_rows])),
+            "mean_mse": float(np.mean([r["mse"] for r in view_rows])),
+            "mean_psnr": float(np.mean([r["psnr"] for r in view_rows])),
+            "mean_ssim": float(np.mean([r["ssim"] for r in view_rows])),
+            "mean_lpips": float(np.mean([r["lpips"] for r in view_rows])),
         })
     with (output_dir / "gt_comparison_cam_summary.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(cam_summary[0].keys()))
+        writer = csv.DictWriter(handle, fieldnames=list(view_summary[0].keys()))
         writer.writeheader()
-        writer.writerows(cam_summary)
+        writer.writerows(view_summary)
 
     save_bar_plot(rows, "psnr", "PSNR (dB, higher is better)", plots_dir / "psnr_by_cam.png")
     save_bar_plot(rows, "ssim", "SSIM (higher is better)", plots_dir / "ssim_by_cam.png")
     save_bar_plot(rows, "lpips", "LPIPS (lower is better)", plots_dir / "lpips_by_cam.png")
 
-    ref_summary = next((s for s in cam_summary if s["is_ref"]), None)
-    novel_summary = [s for s in cam_summary if not s["is_ref"]]
+    ref_summary = next((s for s in view_summary if s["is_ref"]), None)
+    real_novel_summary = [s for s in view_summary if not s["is_ref"]]
 
     report = {
         "work_dir": str(work_dir),
         "novel_views_dir": str(novel_views_dir),
-        "diva_dir": str(args.diva_dir),
-        "ref_cam": args.ref_cam,
+        "dycheck_dir": str(args.dycheck_dir),
+        "ref_view": args.ref_view,
         "lpips_net": args.lpips_net,
         "num_pairs_compared": len(rows),
         "num_pairs_missing_gt": len(missing_gt),
+        "num_synthetic_skipped": skipped_synthetic,
         "missing_gt": missing_gt,
-        "reference_camera_summary": ref_summary,
-        "novel_camera_summary": novel_summary,
-        "per_camera_summary": cam_summary,
+        "reference_view_summary": ref_summary,
+        "real_camera_summary": real_novel_summary,
+        "per_view_summary": view_summary,
         "caveat": (
-            "Reference-camera metrics use the exact trained camera pose and "
-            "measure genuine reconstruction fidelity. Novel-camera metrics use "
-            "an approximate pose (transplanted rig rotation, reference "
+            "camera0 metrics use the exact trained camera pose and measure "
+            "genuine reconstruction fidelity. camera1/camera2 metrics use an "
+            "approximate pose (transplanted relative rotation, reference "
             "intrinsics, approximate radius) and conflate reconstruction "
-            "error with viewpoint/FOV mismatch -- see the module docstring."
+            "error with viewpoint/FOV mismatch -- see the module docstring. "
+            "novel1/novel2/novel3 have no ground truth and are never scored."
         ),
     }
     with (output_dir / "analysis_report.json").open("w", encoding="utf-8") as handle:
@@ -369,21 +393,22 @@ def main() -> None:
     print()
     print("=" * 72)
     print("GT comparison complete")
-    print(f"Pairs compared : {len(rows)}")
-    print(f"Missing GT     : {len(missing_gt)}")
+    print(f"Pairs compared      : {len(rows)}")
+    print(f"Missing GT          : {len(missing_gt)}")
+    print(f"Synthetic (no GT)   : {skipped_synthetic}")
     if ref_summary is not None:
         print(
-            f"Reference ({args.ref_cam}, in-distribution): "
+            f"Reference ({args.ref_view}, in-distribution): "
             f"PSNR={ref_summary['mean_psnr']:.2f} SSIM={ref_summary['mean_ssim']:.3f} "
             f"LPIPS={ref_summary['mean_lpips']:.3f}"
         )
-    for summary in novel_summary:
+    for summary in real_novel_summary:
         print(
-            f"Novel {summary['cam']} (~{summary['angle_deg']:.1f} deg, approximate pose): "
+            f"{summary['view']} (az={summary['azimuth_deg']:.1f} deg, real GT, approximate pose): "
             f"PSNR={summary['mean_psnr']:.2f} SSIM={summary['mean_ssim']:.3f} "
             f"LPIPS={summary['mean_lpips']:.3f}"
         )
-    print(f"Output         : {output_dir}")
+    print(f"Output               : {output_dir}")
     print("=" * 72)
 
 

@@ -4,12 +4,13 @@ Occlusion-aware novel-view contact-patch distance and frame classification.
 
 For each selected cluster pair, frame, and novel camera:
 1. Transform canonical contact-patch Gaussian identities to their current 3D positions.
-2. Build a novel camera by transplanting a nearby DiVa-360 rig camera's
-   orientation (relative to the training camera) onto the trained scene,
-   orbiting around the target at the reference camera's own distance. DiVa-360
-   poses live in a different coordinate frame/scale/axis-convention than the
-   trained (mega-sam) scene, so only the *relative* rotation to the reference
-   camera is transplanted -- see flow3d/analysis/2drender/render_output_novelview.py
+2. Build a novel camera by transplanting a DyCheck view's orientation
+   (camera1/camera2's real relative rotation from camera0, or a synthetic
+   novel1/2/3 offset) onto the trained scene, orbiting around the target at
+   the reference camera's own distance. DyCheck poses live in a different
+   coordinate frame/scale than the trained (mega-sam) scene (though the same
+   OpenCV axis convention), so only the *relative* rotation to camera0 is
+   transplanted -- see flow3d/analysis/2drender/render_output_novelview.py
    for the same technique and a longer explanation.
 3. Render the full scene, then re-render it with patch A removed and with
    patch B removed.
@@ -21,9 +22,9 @@ For each selected cluster pair, frame, and novel camera:
 7. Aggregate valid views per frame into connected, separated, or
    unknown_due_to_occlusion.
 
-Default requested views follow the user's spec:
-- frames: 0,20,40,60,80,99
-- novel cameras (DiVa-360 rig, closest to cam00): cam28,cam39,cam06,cam07,cam43,cam32
+Default requested views:
+- frames: 0,20,40,60,80,99 (spin has 142 frames; override --frames for full coverage)
+- views: all 5 DyCheck views (camera1, camera2, novel1, novel2, novel3)
 """
 
 from __future__ import annotations
@@ -38,6 +39,9 @@ from typing import Any
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+_THIS_DIR = Path(__file__).resolve().parent
+if str(_THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(_THIS_DIR))
 
 import matplotlib
 matplotlib.use("Agg")
@@ -49,45 +53,18 @@ from scipy.spatial import cKDTree
 
 from flow3d.renderer import Renderer
 
-# Fixed local-axis flip between the OpenGL/NeRF convention (DiVa-360
-# transforms.json: camera looks down -Z, Y-up) and the OpenCV convention
-# (mega-sam / the trained scene: camera looks down +Z, Y-down).
-_GL_TO_CV = np.diag([1.0, -1.0, -1.0])
-
-
-def load_diva_cam_poses(diva_dir: Path) -> dict[str, np.ndarray]:
-    """Load DiVa-360 camera-to-world matrices (OpenGL/NeRF axis convention)."""
-    cams: dict[str, np.ndarray] = {}
-    for name in ("transforms_train.json", "transforms_test.json", "transforms_val.json"):
-        path = diva_dir / name
-        if not path.is_file():
-            continue
-        data = json.loads(path.read_text())
-        for frame in data.get("frames", []):
-            parts = frame["file_path"].split("/")
-            if len(parts) < 2:
-                continue
-            cam = parts[1]
-            cams.setdefault(cam, np.array(frame["transform_matrix"], dtype=np.float64))
-    return cams
-
-
-def diva_cam_angle_deg(cams: dict[str, np.ndarray], ref_cam: str, cam_name: str) -> float:
-    """Angular distance of cam_name from ref_cam, about the DiVa-360 rig center."""
-    names = list(cams.keys())
-    positions = np.stack([cams[n][:3, 3] for n in names])
-    center = positions.mean(axis=0)
-    dirs = positions - center
-    dirs = dirs / np.linalg.norm(dirs, axis=1, keepdims=True)
-    ref_dir = dirs[names.index(ref_cam)]
-    cam_dir = dirs[names.index(cam_name)]
-    return float(np.degrees(np.arccos(np.clip(np.dot(ref_dir, cam_dir), -1.0, 1.0))))
-
-
-def relative_rotation_cv(r_ref_gl: np.ndarray, r_cam_gl: np.ndarray) -> np.ndarray:
-    """Relative rotation ref->cam (DiVa-360, OpenGL axes) re-expressed in OpenCV axes."""
-    rel_gl = r_ref_gl.T @ r_cam_gl
-    return _GL_TO_CV @ rel_gl @ _GL_TO_CV
+# Shared DyCheck camera-geometry helpers (camera1/camera2 real poses,
+# novel1/2/3 synthetic poses, all measured about scene.json's "center").
+# See render_output_novelview.py's module docstring for the coordinate-frame
+# reasoning (DyCheck and mega-sam share OpenCV axis conventions, so no
+# OpenGL<->OpenCV flip is needed here, unlike the old DiVa-360 rig case).
+from render_output_novelview import (
+    ALL_VIEW_NAMES,
+    DYCHECK_SUBSAMPLE_INTERVAL,
+    build_candidate_views,
+    load_dycheck_ref_cam,
+    parse_views,
+)
 
 
 EPS = 1e-8
@@ -143,26 +120,18 @@ def build_parser() -> argparse.ArgumentParser:
         help='Comma list or "all". Default matches the requested frames.',
     )
     parser.add_argument(
-        "--diva-dir",
+        "--dycheck-dir",
         type=Path,
-        default=Path("data/DiVa360/processed_data/dog"),
-        help="DiVa-360 sequence dir containing transforms_{train,test,val}.json.",
+        default=Path("data/DyCheck/spin"),
+        help="DyCheck sequence dir containing camera/, scene.json, extra.json.",
     )
     parser.add_argument(
-        "--ref-cam",
+        "--views",
         type=str,
-        default="cam00",
-        help="DiVa-360 camera used for training (the reference orientation).",
-    )
-    parser.add_argument(
-        "--novel-cams",
-        type=str,
-        default="cam28,cam39,cam06,cam07,cam43,cam32",
-        help=(
-            "Comma list of DiVa-360 camera names to render novel views from. "
-            "Each camera's orientation relative to --ref-cam is transplanted "
-            "onto the trained scene; see the module docstring."
-        ),
+        default="all",
+        help=f'Comma list from {ALL_VIEW_NAMES}, or "all" (default: all 5). '
+             "Each view's orientation relative to camera0 is transplanted "
+             "onto the trained scene; see render_output_novelview.py's docstring.",
     )
     parser.add_argument(
         "--reference-camera",
@@ -581,26 +550,25 @@ def camera_center_from_w2c(w2c: torch.Tensor) -> torch.Tensor:
     return -(rotation.transpose(0, 1) @ translation)
 
 
-def diva_novel_camera(
+def transplanted_novel_camera(
     reference_w2c: torch.Tensor,
     target: torch.Tensor,
-    r_ref_diva: np.ndarray,
-    r_cam_diva: np.ndarray,
+    r_rel: np.ndarray,
     radius_scale: float,
 ) -> torch.Tensor:
-    """Build a novel-view w2c by transplanting a DiVa-360 camera's orientation
-    relative to the reference camera onto the trained scene, orbiting around
-    `target` at the reference camera's own distance (DiVa-360's absolute
-    translation scale is not usable here -- see the module docstring).
+    """Build a novel-view w2c by transplanting a DyCheck view's orientation
+    relative to camera0 onto the trained scene, orbiting around `target` at
+    the reference camera's own distance (DyCheck's absolute translation scale
+    is not usable here -- see render_output_novelview.py's module docstring).
+    `r_rel` is precomputed once (anchored at DyCheck camera0 frame 0) by
+    build_candidate_views()/load_dycheck_ref_cam(), not per call.
     """
     center = camera_center_from_w2c(reference_w2c)
     radius = (center - target).norm().clamp_min(EPS) * radius_scale
 
     r_ref_train = reference_w2c[:3, :3].transpose(0, 1)  # c2w rotation
-    r_rel_cv = torch.from_numpy(relative_rotation_cv(r_ref_diva, r_cam_diva)).to(
-        device=r_ref_train.device, dtype=r_ref_train.dtype
-    )
-    r_novel = r_ref_train @ r_rel_cv  # c2w rotation, OpenCV local axes
+    r_rel_t = torch.from_numpy(r_rel).to(device=r_ref_train.device, dtype=r_ref_train.dtype)
+    r_novel = r_ref_train @ r_rel_t  # c2w rotation, OpenCV local axes
     forward = r_novel[:, 2]
     forward = forward / forward.norm().clamp_min(EPS)
     new_center = target - radius * forward
@@ -1098,24 +1066,21 @@ def main() -> None:
     requested_pairs = parse_pair_subset(args.pairs)
     excluded_pairs = parse_pair_subset(args.exclude_pairs) if args.exclude_pairs is not None else set()
 
-    if not args.diva_dir.is_dir():
-        raise FileNotFoundError(f"DiVa-360 sequence dir not found: {args.diva_dir}")
-    diva_cams = load_diva_cam_poses(args.diva_dir)
-    novel_cam_names = [name.strip() for name in args.novel_cams.split(",") if name.strip()]
-    if not novel_cam_names:
-        raise ValueError("--novel-cams must list at least one DiVa-360 camera.")
-    missing_cams = [name for name in [args.ref_cam, *novel_cam_names] if name not in diva_cams]
-    if missing_cams:
-        raise ValueError(
-            f"Camera(s) not found in DiVa-360 calibration ({args.diva_dir}): {missing_cams}"
-        )
-    r_ref_diva = diva_cams[args.ref_cam][:3, :3]
-    novel_cam_angle_deg = {
-        name: diva_cam_angle_deg(diva_cams, args.ref_cam, name) for name in novel_cam_names
+    if not args.dycheck_dir.is_dir():
+        raise FileNotFoundError(f"DyCheck sequence dir not found: {args.dycheck_dir}")
+    novel_cam_names = parse_views(args.views)
+    candidate_views = build_candidate_views(args.dycheck_dir, novel_cam_names)
+    # Anchored once at DyCheck camera0's first frame (SfM gauge origin, always
+    # present) -- see render_output_novelview.py's module docstring.
+    _, r_ref_dycheck = load_dycheck_ref_cam(args.dycheck_dir, 0)
+    relative_rotations = {
+        name: r_ref_dycheck.T @ v["r_c2w"] for name, v in candidate_views.items()
     }
-    print(f"Novel views from {len(novel_cam_names)} DiVa-360 camera(s) relative to {args.ref_cam}:")
+    novel_cam_angle_deg = {name: v["azimuth_deg"] for name, v in candidate_views.items()}
+    print(f"Novel views from {len(novel_cam_names)} DyCheck view(s) relative to camera0:")
     for name in novel_cam_names:
-        print(f"  {name}: {novel_cam_angle_deg[name]:.1f} deg")
+        v = candidate_views[name]
+        print(f"  {name}: azimuth={v['azimuth_deg']:.1f} deg, elevation={v['elevation_deg']:.1f} deg")
 
     device_name = args.device
     if device_name.startswith("cuda") and not torch.cuda.is_available():
@@ -1283,11 +1248,10 @@ def main() -> None:
                 current_frame_rows: list[dict[str, Any]] = []
 
                 for cam_name in novel_cam_names:
-                    novel_w2c = diva_novel_camera(
+                    novel_w2c = transplanted_novel_camera(
                         reference_w2c=reference_w2c,
                         target=target,
-                        r_ref_diva=r_ref_diva,
-                        r_cam_diva=diva_cams[cam_name][:3, :3],
+                        r_rel=relative_rotations[cam_name],
                         radius_scale=args.orbit_radius_scale,
                     )
 
@@ -1862,8 +1826,8 @@ def main() -> None:
                 for row in top_ambiguous_pair_rows
             ],
             "frames": frames,
-            "diva_dir": str(args.diva_dir),
-            "ref_cam": args.ref_cam,
+            "dycheck_dir": str(args.dycheck_dir),
+            "ref_view": "camera0",
             "novel_cams": novel_cam_names,
             "novel_cam_angles_deg": novel_cam_angle_deg,
             "reference_camera": args.reference_camera,
