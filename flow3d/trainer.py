@@ -24,7 +24,7 @@ from flow3d.loss_utils import (
     center_to_cluster_mean_loss,
     compute_arap_distance_loss,
 )
-from flow3d.data.utils import compute_depth_normal_mask
+from flow3d.data.utils import compute_depth_normal_mask, to_device
 from flow3d.metrics import PCK, mLPIPS, mPSNR, mSSIM
 from flow3d.scene_model import SceneModel
 from flow3d.vis.utils import get_server
@@ -195,6 +195,11 @@ class Trainer:
             self.viewer.lock.acquire()
 
         loss, stats, num_rays_per_step, num_rays_per_sec = self.compute_losses(batch)
+
+        extra_loss, extra_stats = self.compute_extra_view_losses(batch["ts"])
+        loss = loss + extra_loss
+        stats.update(extra_stats)
+
         if loss.isnan():
             guru.info(f"Loss is NaN at step {self.global_step}!!")
             import ipdb
@@ -221,6 +226,97 @@ class Trainer:
                 self.viewer.update(self.global_step, num_rays_per_step)
 
         return loss.item()
+
+    def compute_extra_view_losses(self, ts: torch.Tensor):
+        """
+        Photometric-only (RGB + mask + depth) supervision from extra camera
+        views (e.g. other cameras in a multi-view rig), in addition to the
+        primary view's full compute_losses(). No 2D-track/normal losses here
+        -- extra views don't have (or need) CoTracker-based motion init, and
+        gaussian poses at a given timestep don't depend on which camera
+        renders them, so we just re-render the same means/quats used for the
+        primary view from each extra view's camera.
+
+        A no-op (returns (0.0, {})) unless self.extra_view_datasets has been
+        set externally (see run_training.py) -- keeps single-view training
+        completely unaffected when multi-view isn't requested.
+        """
+        extra_view_datasets = getattr(self, "extra_view_datasets", None)
+        if not extra_view_datasets:
+            return 0.0, {}
+
+        self.model.training = True
+        device = ts.device
+        B = ts.shape[0]
+
+        means, quats = self.model.compute_poses_all(ts)  # (G, B, 3), (G, B, 4)
+        means = means.transpose(0, 1)
+        quats = quats.transpose(0, 1)
+
+        loss = 0.0
+        rgb_loss_sum, mask_loss_sum, depth_loss_sum = 0.0, 0.0, 0.0
+        n_terms = 0
+        for view_name, ds in extra_view_datasets.items():
+            for i in range(B):
+                idx = ts[i].item()
+                sample = to_device(
+                    {
+                        "img": ds.get_image(idx),
+                        "fg_mask": ds.get_fg_mask(idx).float(),
+                        "depth": ds.get_depth(idx),
+                        "depth_mask": ds.get_depth_mask(idx),
+                        "w2c": ds.w2cs[idx],
+                        "K": ds.Ks[idx],
+                    },
+                    device,
+                )
+                H, W = sample["img"].shape[:2]
+                bg_color = torch.ones(1, 3, device=device)
+                rendered = self.model.render(
+                    idx,
+                    sample["w2c"][None],
+                    sample["K"][None],
+                    (W, H),
+                    means=means[i],
+                    quats=quats[i],
+                    bg_color=bg_color,
+                    return_depth=True,
+                )
+
+                rgb_loss = 0.8 * F.l1_loss(rendered["img"], sample["img"][None]) + 0.2 * (
+                    1 - self.ssim(
+                        rendered["img"].permute(0, 3, 1, 2),
+                        sample["img"][None].permute(0, 3, 1, 2),
+                    )
+                )
+                mask_loss = F.mse_loss(rendered["acc"], sample["fg_mask"][None, ..., None])
+
+                pred_disp = 1.0 / (cast(torch.Tensor, rendered["depth"]) + 1e-5)
+                tgt_disp = 1.0 / (sample["depth"][None, ..., None] + 1e-5)
+                depth_loss = masked_l1_loss(
+                    pred_disp, tgt_disp,
+                    mask=sample["depth_mask"][None, ..., None],
+                    quantile=0.98,
+                )
+
+                view_loss = (
+                    rgb_loss * self.losses_cfg.w_rgb
+                    + mask_loss * self.losses_cfg.w_mask
+                    + depth_loss * self.losses_cfg.w_depth_reg
+                )
+                loss = loss + view_loss
+                rgb_loss_sum += rgb_loss.item()
+                mask_loss_sum += mask_loss.item()
+                depth_loss_sum += depth_loss.item()
+                n_terms += 1
+
+        loss = loss / n_terms * self.losses_cfg.w_multiview
+        stats = {
+            "train/multiview_rgb_loss": rgb_loss_sum / n_terms,
+            "train/multiview_mask_loss": mask_loss_sum / n_terms,
+            "train/multiview_depth_loss": depth_loss_sum / n_terms,
+        }
+        return loss, stats
 
     def compute_bg_losses(self, batch):
         """
@@ -1426,6 +1522,39 @@ class Trainer:
 
         should_split = is_grad_too_high & (is_scale_too_big | is_radius_too_big)
         should_dup = is_grad_too_high & ~is_scale_too_big
+
+        # Optional hard caps (env vars) to prevent gaussian count from exploding
+        # over long schedules: MAX_NUM_GAUSSIANS bounds the total count, and
+        # MAX_DENSIFY_PER_STEP bounds how many new gaussians a single control
+        # step may add. Splits/dups are net +1 gaussian each, so when the
+        # candidate count exceeds the cap we keep only the highest-gradient
+        # candidates (the ones the threshold logic is most confident about).
+        max_num_gaussians = int(os.environ["MAX_NUM_GAUSSIANS"]) if "MAX_NUM_GAUSSIANS" in os.environ else None
+        max_densify_per_step = int(os.environ["MAX_DENSIFY_PER_STEP"]) if "MAX_DENSIFY_PER_STEP" in os.environ else None
+        if max_num_gaussians is not None or max_densify_per_step is not None:
+            cap = max_densify_per_step
+            if max_num_gaussians is not None:
+                room = max(0, max_num_gaussians - self.model.num_gaussians)
+                cap = room if cap is None else min(cap, room)
+            candidate_mask = should_split | should_dup
+            num_candidates = int(candidate_mask.sum().item())
+            if cap is not None and num_candidates > cap:
+                candidate_idx = torch.where(candidate_mask)[0]
+                priority = xys_grad_avg[candidate_idx]
+                keep_idx = (
+                    candidate_idx[torch.topk(priority, cap).indices]
+                    if cap > 0
+                    else candidate_idx[:0]
+                )
+                keep_mask = torch.zeros_like(candidate_mask)
+                keep_mask[keep_idx] = True
+                should_split = should_split & keep_mask
+                should_dup = should_dup & keep_mask
+                guru.info(
+                    f"Densify cap active: {num_candidates} candidates -> kept {cap} "
+                    f"(num_gaussians={self.model.num_gaussians}, MAX_NUM_GAUSSIANS={max_num_gaussians}, "
+                    f"MAX_DENSIFY_PER_STEP={max_densify_per_step})"
+                )
 
         num_fg = self.model.num_fg_gaussians
         num_bg = self.model.num_bg_gaussians

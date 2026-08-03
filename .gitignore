@@ -15,3 +15,27 @@ preproc/checkpoints/
 .idea/
 .claude/
 run.sh
+
+# Local datasets
+/data/
+
+# Training artifacts
+*.ckpt
+events.out.tfevents.*
+wandb/
+runs/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# OS files
+.DS_Store

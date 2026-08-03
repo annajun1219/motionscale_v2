@@ -42,7 +42,8 @@ class DavisDataConfig:
     image_type: str = "JPEGImages"
     mask_type: str = "Segmentation"
     depth_type: str = "aligned_depth_anything"
-    camera_type: Literal["droid_recon", "megasam"] = "megasam"
+    depth_is_metric: bool = False
+    camera_type: Literal["droid_recon", "megasam", "static_rig"] = "megasam"
     slam_type: str = "megasam/outputs_cvd"
     track_2d_type: str = "cotracker3"
     normals_type: str | None = None
@@ -63,7 +64,8 @@ class CustomDataConfig:
     image_type: str = "images"
     mask_type: str = "masks"
     depth_type: str = "aligned_depth_anything"
-    camera_type: Literal["droid_recon", "megasam"] = "megasam"
+    depth_is_metric: bool = False
+    camera_type: Literal["droid_recon", "megasam", "static_rig"] = "megasam"
     slam_type: str = "megasam/outputs_cvd"
     track_2d_type: str = "cotracker3"
     normals_type: str | None = None
@@ -85,7 +87,8 @@ class CasualDataset(BaseDataset):
         image_type: str = "JPEGImages",
         mask_type: str = "Segmentation",
         depth_type: str = "aligned_depth_anything",
-        camera_type: Literal["droid_recon", "megasam"] = "megasam",
+        depth_is_metric: bool = False,
+        camera_type: Literal["droid_recon", "megasam", "static_rig"] = "megasam",
         slam_type: str = "megasam/outputs_cvd",
         track_2d_type: str = "cotracker3",
         normals_type: str | None = None,
@@ -107,11 +110,19 @@ class CasualDataset(BaseDataset):
         self.has_validation = False
         self.mask_erosion_radius = mask_erosion_radius
         self.track_2d_type = track_2d_type
+        self.depth_is_metric = depth_is_metric
 
         self.img_dir = os.path.join(root_dir, image_type, res, seq_name)
         self.img_ext = os.path.splitext(os.listdir(self.img_dir)[0])[1]
         preproc_dir = os.path.join(root_dir, "flow3d_preprocessed", res, seq_name)
-        self.depth_dir = os.path.join(preproc_dir, depth_type)
+        # Pi3/MoGe-style metric depth scripts write into a "depths" subfolder
+        # (see preproc/compute_depths_moge.py, preproc/compute_depths_pi3.py);
+        # existing disparity-style depth_types are flat under preproc_dir/depth_type.
+        self.depth_dir = (
+            os.path.join(preproc_dir, depth_type, "depths")
+            if depth_is_metric
+            else os.path.join(preproc_dir, depth_type)
+        )
         self.mask_dir = os.path.join(preproc_dir, mask_type)
         self.tracks_dir = os.path.join(preproc_dir, track_2d_type)
         self.cache_dir = os.path.join(preproc_dir, "cache")
@@ -136,10 +147,13 @@ class CasualDataset(BaseDataset):
         # load cameras
         img = self.get_image(0)
         H, W = img.shape[:2]
+        self.img_hw = (H, W)
         if camera_type == "megasam":
             w2cs, Ks, tstamps = load_cameras_megasam(os.path.join(self.slam_dir, f"{seq_name}.npz"), H, W)
         elif camera_type == "droid_recon":
             w2cs, Ks, tstamps = load_cameras(os.path.join(preproc_dir, f"{camera_type}.npy"), H, W)
+        elif camera_type == "static_rig":
+            w2cs, Ks, tstamps = load_cameras(os.path.join(preproc_dir, "static_rig.npy"), H, W)
         else:
             raise ValueError(f"Unknown camera type: {camera_type}")
 
@@ -313,9 +327,16 @@ class CasualDataset(BaseDataset):
 
     def load_depth(self, index) -> torch.Tensor:
         path = f"{self.depth_dir}/{self.frame_names[index]}.npy"
-        disp = np.load(path)
-        depth = 1.0 / np.clip(disp, a_min=1e-6, a_max=1e6)
-        depth = torch.from_numpy(depth).float()
+        raw = np.load(path)
+        if self.depth_is_metric:
+            depth = torch.from_numpy(raw).float()
+            if tuple(depth.shape[-2:]) != tuple(self.img_hw):
+                depth = F.interpolate(
+                    depth[None, None], size=self.img_hw, mode="nearest-exact",
+                )[0, 0]
+        else:
+            depth = 1.0 / np.clip(raw, a_min=1e-6, a_max=1e6)
+            depth = torch.from_numpy(depth).float()
         depth = median_filter_2d(depth[None, None], 11, 1)[0, 0]
         return depth
 
