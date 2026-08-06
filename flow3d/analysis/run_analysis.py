@@ -3,22 +3,20 @@
 Run the full MotionScale contact-analysis pipeline for one trained checkpoint:
 
     cluster_pairs.py -> contactpatch.py -> contactpatch_distance.py
-        -> contactpatch_render.py -> gt_analyze.py
+        -> contactpatch_render.py -> render_output_novelview.py -> gt_analyze.py
 
-Each stage writes into <work-dir>/analysis/... using its own defaults, and
-the next stage reads from those same defaults (--ckpt/--pair-file/
---contact-patch-file all default to the previous stage's output path), so
-this script just runs them in order with --work-dir (and a few shared
-overrides) forwarded to each.
+Each stage writes into <work-dir>/analysis/... (or, for render_output_novelview.py,
+<work-dir>/novel_views/...) using its own defaults, and the next stage reads
+from those same defaults (--ckpt/--pair-file/--contact-patch-file all default
+to the previous stage's output path), so this script just runs them in order
+with --work-dir (and a few shared overrides) forwarded to each.
 
 Dependency note
 ----------------
-gt_analyze.py additionally requires
-flow3d/analysis/2drender/render_output_novelview.py to have *already* been
-run for this work-dir (it reads <work-dir>/novel_views/selection_summary.json,
-which this script does not produce). Run that separately first -- this
-script checks for it up front and fails fast with a clear message if it's
-missing, rather than burning time on the first four stages before finding out.
+gt_analyze.py requires flow3d/analysis/2drender/render_output_novelview.py to
+have already been run for this work-dir (it reads
+<work-dir>/novel_views/selection_summary.json). This script now runs that
+stage automatically, right before gt_analyze.py.
 
 Example
 -------
@@ -40,6 +38,7 @@ STAGES = [
     "contactpatch",
     "contactpatch_distance",
     "contactpatch_render",
+    "render_novelview",
     "gt_analyze",
 ]
 
@@ -80,20 +79,9 @@ def main() -> None:
         raise ValueError(f"Unknown stage(s) in --skip: {invalid}; choose from {STAGES}")
 
     work_dir = args.work_dir
-    if not (work_dir / "checkpoints" / "last.ckpt").is_file():
-        raise FileNotFoundError(f"No checkpoint at {work_dir}/checkpoints/last.ckpt")
-
-    novel_views_summary = work_dir / "novel_views" / "selection_summary.json"
-    if "gt_analyze" not in skip and not novel_views_summary.is_file():
-        raise FileNotFoundError(
-            f"{novel_views_summary} not found. gt_analyze.py needs "
-            "render_output_novelview.py to have already been run for this "
-            "work-dir. Run that first, e.g.:\n"
-            f"  python flow3d/analysis/2drender/render_output_novelview.py "
-            f"--ckpt {work_dir}/checkpoints/last.ckpt --seq_name {args.seq_name} "
-            f"--config {args.config} --dycheck_dir {args.dycheck_dir}\n"
-            "...or pass --skip gt_analyze to run the other four stages only."
-        )
+    ckpt = work_dir / "checkpoints" / "last.ckpt"
+    if not ckpt.is_file():
+        raise FileNotFoundError(f"No checkpoint at {ckpt}")
 
     commands = {
         "cluster_pairs": [
@@ -113,6 +101,14 @@ def main() -> None:
             "--work-dir", str(work_dir),
             "--dycheck-dir", str(args.dycheck_dir),
             "--frames", args.contactpatch_render_frames,
+            "--device", args.device,
+        ],
+        "render_novelview": [
+            sys.executable, "flow3d/analysis/2drender/render_output_novelview.py",
+            "--ckpt", str(ckpt),
+            "--config", str(args.config),
+            "--seq_name", args.seq_name,
+            "--dycheck_dir", str(args.dycheck_dir),
             "--device", args.device,
         ],
         "gt_analyze": [

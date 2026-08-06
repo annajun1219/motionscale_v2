@@ -234,7 +234,19 @@ class SceneModel(nn.Module):
             bg = GaussianParams.init_from_state_dict(
                 state_dict, prefix=f"{prefix}bg."
             )
-        if f"{prefix}motion_bases.params.fine_rots" in state_dict:
+        if any(f"{prefix}motion_bases.graph_gnn." in k for k in state_dict):
+            # flow3d/experiment/graph/cluster_graph_gnn.py: coarse transform is
+            # corrected by a graph attention network on top of a ScalableMotionBases.
+            # Loading it as a plain ScalableMotionBases would silently drop the
+            # correction (it's applied at forward time, not baked into params).
+            from flow3d.experiment.graph.cluster_graph_gnn import (
+                GraphCorrectedScalableMotionBases,
+            )
+
+            motion_bases = GraphCorrectedScalableMotionBases.init_from_state_dict(
+                state_dict, prefix=f"{prefix}motion_bases."
+            )
+        elif f"{prefix}motion_bases.params.fine_rots" in state_dict:
             motion_bases = ScalableMotionBases.init_from_state_dict(state_dict, prefix=f"{prefix}motion_bases.params.")
         else:
             motion_bases = MotionBases.init_from_state_dict(state_dict, prefix=f"{prefix}motion_bases.params.")
