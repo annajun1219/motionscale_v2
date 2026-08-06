@@ -1,3 +1,4 @@
+import os
 import time
 from typing import Literal
 
@@ -13,6 +14,9 @@ import torch.nn.functional as F
 from cuml import HDBSCAN, KMeans
 from loguru import logger as guru
 from matplotlib.pyplot import get_cmap
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+from scipy.spatial import cKDTree
 from tqdm import tqdm
 from viser import ViserServer
 
@@ -509,6 +513,13 @@ def init_motion_params_with_procrustes(
     coefs_sigma: float = 0.6,
     vis: bool = False,
     port: int | None = None,
+    affinity_k: int = 12,
+    affinity_cut_percentile: float = 85.0,
+    affinity_min_cluster_size: int = 20,
+    affinity_method: str = "agglomerative",
+    affinity_n_clusters: int = 40,
+    work_dir: str | None = None,
+    train_dataset=None,
 ) -> tuple[MotionBases, torch.Tensor, TrackObservations]:
     """
     Sample centers and get initial se3 motion bases by solving procrustes
@@ -560,6 +571,38 @@ def init_motion_params_with_procrustes(
         sampled_centers, num_bases, labels = sample_initial_bases_centers(
             cluster_init_method, cano_t, tracks_3d, num_bases
         )
+    elif cluster_init_type == "motion_affinity":
+        labels = cluster_by_motion_affinity(
+            means_cano, tracks_3d,
+            k=affinity_k, cut_percentile=affinity_cut_percentile,
+            min_cluster_size=affinity_min_cluster_size, method=affinity_method,
+            n_clusters=affinity_n_clusters,
+        )
+        num_bases = int(labels.max().item()) + 1
+        sampled_centers = torch.stack(
+            [means_cano[labels == i].median(dim=0).values for i in range(num_bases)]
+        )[None]
+
+        if work_dir is not None:
+            from flow3d.analysis.init_cluster_vis import (
+                save_cluster_init_png,
+                save_cluster_overlay_video,
+            )
+
+            diag_dir = os.path.join(work_dir, "analysis", "motion_affinity_init")
+            png_path = save_cluster_init_png(means_cano, labels, diag_dir)
+            guru.info(f"Saved motion-affinity cluster diagnostic to {png_path}")
+
+            if train_dataset is not None:
+                imgs = torch.stack(
+                    [train_dataset.get_image(t) for t in range(num_frames)]
+                )
+                Ks = train_dataset.get_Ks()[:num_frames]
+                w2cs = train_dataset.get_w2cs()[:num_frames]
+                video_path = save_cluster_overlay_video(
+                    tracks_3d, labels, imgs, Ks, w2cs, diag_dir,
+                )
+                guru.info(f"Saved motion-affinity cluster overlay video to {video_path}")
     else:
         raise ValueError(f"Invalid cluster_init_type: {cluster_init_type}")
 
@@ -1557,6 +1600,195 @@ def sample_initial_bases_centers(
     )[None]
     print("number of {} clusters: ".format(mode), num_bases)
     return sampled_centers, num_bases, torch.tensor(labels).cpu()
+
+
+def cluster_by_motion_affinity(
+    means_cano: torch.Tensor,
+    tracks_3d: TrackObservations,
+    k: int = 12,
+    cut_percentile: float = 85.0,
+    min_cluster_size: int = 20,
+    method: str = "agglomerative",
+    min_covisible_frames: int = 5,
+    n_clusters: int = 40,
+) -> torch.Tensor:
+    """
+    Cluster tracks by combining spatial kNN coherence with temporal relative-motion,
+    so that spatially adjacent but independently-moving parts (e.g. a hand resting on
+    a thigh) end up in different clusters.
+
+    method="agglomerative" (default): the spatial kNN graph is used purely as a hard
+    connectivity constraint (only spatially-adjacent points may ever be merged), and
+    sklearn's connectivity-constrained AgglomerativeClustering (ward linkage) groups
+    points by their per-node velocity trajectory into exactly n_clusters clusters.
+    Because ward linkage merges based on the *pairwise* distance between velocity
+    features, any common whole-body motion (shared by every node) cancels out in that
+    difference, so the relative/joint motion is what actually drives the merge -- e.g.
+    a hand's velocity relative to a walking body differs from the thigh's, even though
+    both include the same body-wide translation.
+
+    method="components" (legacy, kept for compatibility): edges are weighted by the
+    variance of the co-visible, mean-normalized relative distance between the two
+    tracks over time, edges above the cut_percentile are cut, and connected components
+    of the surviving graph become clusters. NOTE: on dense kNN graphs this tends to
+    collapse to a single giant component even after cutting -- cut_fraction reflects
+    the fixed percentile, not an actual separation signal -- which is why
+    "agglomerative" is now the default.
+
+    Both methods finish with the same post-processing: components/clusters smaller
+    than min_cluster_size are treated as noise and reassigned to their nearest valid
+    cluster (by canonical position), same pattern as sample_bases_centers_by_means.
+
+    :param means_cano: (N, 3) canonical positions
+    :param tracks_3d: TrackObservations with xyz (N, T, 3), visibles (N, T), confidences (N, T)
+    :param k: number of spatial kNN neighbors per point used to build the connectivity graph
+    :param cut_percentile: (method="components" only) edges with normalized
+        relative-motion variance above this percentile (of the reliable edges) are cut
+    :param min_cluster_size: clusters smaller than this are treated as noise and
+        reassigned to the nearest valid cluster
+    :param method: "agglomerative" (default) or "components"
+    :param min_covisible_frames: (method="components" only) edges with fewer
+        co-visible frames than this are considered unreliable and are never cut
+        (their variance is replaced by the median of the reliable edges)
+    :param n_clusters: (method="agglomerative" only) number of clusters to produce
+    :return: cluster_ids (N,) int64, remapped to a contiguous 0..C-1 range
+    """
+    assert method in ("agglomerative", "components")
+    eps = 1e-8
+    device = means_cano.device
+    N = means_cano.shape[0]
+
+    if N <= 1:
+        return torch.zeros(N, dtype=torch.long, device=device)
+
+    # spatial kNN graph (undirected, deduplicated, no self-loops)
+    means_np = means_cano.detach().cpu().numpy()
+    k_eff = max(1, min(k, N - 1))
+    tree = cKDTree(means_np)
+    _, knn_idx = tree.query(means_np, k=k_eff + 1)  # (N, k_eff+1), col 0 is self
+    knn_idx = np.atleast_2d(knn_idx)
+    src = np.repeat(np.arange(N), k_eff)
+    dst = knn_idx[:, 1:].reshape(-1)
+    pairs = np.stack([np.minimum(src, dst), np.maximum(src, dst)], axis=1)
+    pairs = pairs[pairs[:, 0] != pairs[:, 1]]
+    edges_np = np.unique(pairs, axis=0)  # (M, 2)
+    i_np, j_np = edges_np[:, 0], edges_np[:, 1]
+    num_edges = edges_np.shape[0]
+
+    cut_fraction = None
+    if method == "agglomerative":
+        from sklearn.cluster import AgglomerativeClustering
+
+        xyz = tracks_3d.xyz.to(device)
+        visibles = tracks_3d.visibles.to(device).bool()
+        confidences = tracks_3d.confidences.to(device).float()
+
+        # per-node velocity feature over consecutive frames, zeroed when either
+        # frame is invisible and confidence-weighted otherwise (depth-noise damping).
+        # no absolute position here -- spatial coherence is already enforced by the
+        # connectivity constraint below.
+        delta = xyz[:, 1:] - xyz[:, :-1]  # (N, T-1, 3)
+        delta_vis = (visibles[:, 1:] & visibles[:, :-1]).float()  # (N, T-1)
+        delta_w = confidences[:, 1:] * confidences[:, :-1] * delta_vis  # (N, T-1)
+        velocity_feat = (delta * delta_w[..., None]).reshape(N, -1)  # (N, (T-1)*3)
+
+        # normalize by scene scale so ward's squared-distance criterion is scale-free
+        scene_scale = (
+            (means_cano - means_cano.mean(dim=0)).norm(dim=1).quantile(0.98).clamp_min(eps)
+        )
+        velocity_feat = velocity_feat / scene_scale
+
+        row = np.concatenate([i_np, j_np])
+        col = np.concatenate([j_np, i_np])
+        data = np.ones_like(row, dtype=np.float32)
+        connectivity = coo_matrix((data, (row, col)), shape=(N, N))
+
+        n_clusters_eff = int(max(1, min(n_clusters, N)))
+        model = AgglomerativeClustering(
+            n_clusters=n_clusters_eff, connectivity=connectivity, linkage="ward",
+        )
+        raw_labels = model.fit_predict(velocity_feat.detach().cpu().numpy())
+        labels = torch.from_numpy(raw_labels).long()
+    else:  # method == "components" (legacy)
+        edges = torch.from_numpy(edges_np).to(device=device, dtype=torch.long)
+        i_idx, j_idx = edges[:, 0], edges[:, 1]
+
+        xyz = tracks_3d.xyz.to(device)
+        visibles = tracks_3d.visibles.to(device).bool()
+        confidences = tracks_3d.confidences.to(device).float()
+
+        d = torch.linalg.norm(xyz[i_idx] - xyz[j_idx], dim=-1)  # (M, T)
+        vis_mask = visibles[i_idx] & visibles[j_idx]  # (M, T)
+        w = confidences[i_idx] * confidences[j_idx] * vis_mask.float()  # (M, T)
+        n_covis = vis_mask.sum(dim=1)  # (M,)
+
+        w_sum = w.sum(dim=1).clamp_min(eps)
+        mu = (w * d).sum(dim=1) / w_sum  # weighted mean distance, per edge
+        d_hat = d / mu.clamp_min(eps)[:, None]  # depth-noise-robust relative variation
+        var = (w * (d_hat - 1.0) ** 2).sum(dim=1) / w_sum  # weighted variance of d_hat
+
+        reliable_mask = n_covis >= min_covisible_frames
+        if reliable_mask.any():
+            reliable_var = var[reliable_mask]
+            var = torch.where(reliable_mask, var, reliable_var.median())
+            threshold = torch.quantile(reliable_var, cut_percentile / 100.0)
+        else:
+            # no edge has enough co-visible frames; keep everything (can't judge reliably)
+            threshold = var.max() if num_edges > 0 else torch.tensor(0.0, device=device)
+
+        # never cut unreliable edges -- fall back to keeping them (false-cut prevention)
+        keep_mask = (var <= threshold) | (~reliable_mask)
+
+        cut_fraction = 0.0
+        if reliable_mask.any():
+            cut_fraction = (~keep_mask)[reliable_mask].float().mean().item()
+
+        kept_i = i_idx[keep_mask].cpu().numpy()
+        kept_j = j_idx[keep_mask].cpu().numpy()
+
+        row = np.concatenate([kept_i, kept_j])
+        col = np.concatenate([kept_j, kept_i])
+        data = np.ones_like(row, dtype=np.float32)
+        graph = coo_matrix((data, (row, col)), shape=(N, N))
+        _, raw_labels = connected_components(graph, directed=False)
+        labels = torch.from_numpy(raw_labels).long()
+
+    # reassign small (noise) clusters to nearest valid cluster centroid
+    ids, counts = labels.unique(return_counts=True)
+    valid_ids = ids[counts >= min_cluster_size]
+    noise_mask = ~torch.isin(labels, valid_ids)
+    num_noise = int(noise_mask.sum().item())
+
+    if valid_ids.numel() == 0:
+        # degenerate case: everything below min_cluster_size -- keep as one cluster
+        labels = torch.zeros_like(labels)
+    elif noise_mask.any():
+        centroids = torch.stack(
+            [means_cano[labels == vid].median(dim=0).values for vid in valid_ids]
+        )  # (C, 3)
+        dists = torch.cdist(means_cano[noise_mask], centroids)
+        nearest = dists.argmin(dim=1)
+        labels = labels.clone()
+        labels[noise_mask] = valid_ids[nearest]
+
+    # remap to a contiguous 0..C-1 range
+    _, cluster_ids = labels.unique(return_inverse=True)
+    _, final_counts = cluster_ids.unique(return_counts=True) if cluster_ids.numel() > 0 else (None, torch.tensor([]))
+    num_clusters = int(cluster_ids.max().item()) + 1 if cluster_ids.numel() > 0 else 0
+    size_min = int(final_counts.min().item()) if final_counts.numel() > 0 else 0
+    size_median = int(final_counts.median().item()) if final_counts.numel() > 0 else 0
+    size_max = int(final_counts.max().item()) if final_counts.numel() > 0 else 0
+
+    msg = (
+        f"[cluster_by_motion_affinity method={method}] num_clusters={num_clusters}, "
+        f"edges={num_edges}, cluster_size(min/median/max)=({size_min}/{size_median}/{size_max}), "
+        f"noise_reassigned={num_noise}"
+    )
+    if cut_fraction is not None:
+        msg += f", cut_fraction={cut_fraction:.3f}"
+    print(msg)
+
+    return cluster_ids
 
 
 def interp_masked(vals: cp.ndarray, mask: cp.ndarray, pad: int = 1) -> cp.ndarray:

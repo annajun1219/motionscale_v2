@@ -298,6 +298,12 @@ def initialize_and_checkpoint_model(
         num_motion_bases=cfg.num_motion_bases,
         num_fine_bases=cfg.num_fine_bases,
         cluster_init_type=cfg.cluster_init_type,
+        affinity_k=cfg.affinity_k,
+        affinity_cut_percentile=cfg.affinity_cut_percentile,
+        affinity_min_cluster_size=cfg.affinity_min_cluster_size,
+        affinity_method=cfg.affinity_method,
+        affinity_n_clusters=cfg.affinity_n_clusters,
+        work_dir=cfg.work_dir,
         coefs_type=cfg.optim.coefs_type,
         coefs_sigma=cfg.optim.coefs_sigma,
         vis=vis,
@@ -337,6 +343,12 @@ def init_model_from_tracks(
     cluster_init_type: str,
     coefs_type: str,
     coefs_sigma: float,
+    affinity_k: int = 12,
+    affinity_cut_percentile: float = 85.0,
+    affinity_min_cluster_size: int = 20,
+    affinity_method: str = "agglomerative",
+    affinity_n_clusters: int = 40,
+    work_dir: str | None = None,
     vis: bool = False,
     port: int | None = None,
 ):
@@ -355,6 +367,10 @@ def init_model_from_tracks(
         tracks_3d, num_motion_bases, rot_type, cano_t,
         cluster_init_type=cluster_init_type, bases_type=bases_type, num_fine_bases=num_fine_bases,
         coefs_type=coefs_type, coefs_sigma=coefs_sigma, vis=vis, port=port,
+        affinity_k=affinity_k, affinity_cut_percentile=affinity_cut_percentile,
+        affinity_min_cluster_size=affinity_min_cluster_size, affinity_method=affinity_method,
+        affinity_n_clusters=affinity_n_clusters, work_dir=work_dir,
+        train_dataset=train_dataset,
     )
     motion_bases = motion_bases.to(device)
 

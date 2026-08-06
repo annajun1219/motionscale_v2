@@ -3,6 +3,18 @@ work_dir: 'outputs/davis/'
 dataset: 'davis'
 data_dir: '/path/to/DAVIS/'
 
+# Cluster init: default is "means" (spatial k-means). To separate spatially-adjacent
+# but independently-moving parts (e.g. a hand resting on a thigh), switch to
+# "motion_affinity" -- spatial kNN graph used as a hard connectivity constraint,
+# clustered on per-node velocity via connectivity-constrained agglomerative (ward)
+# clustering into a fixed number of clusters.
+# cluster_init_type: "motion_affinity"
+# affinity_k: 12
+# affinity_method: "agglomerative"   # or "components" (legacy percentile-cut, kept for compat)
+# affinity_n_clusters: 40            # only used when affinity_method == "agglomerative"
+# affinity_min_cluster_size: 20
+# affinity_cut_percentile: 85.0      # only used when affinity_method == "components"
+
 # Data config
 data:
   mask_type: "sam2_masks"

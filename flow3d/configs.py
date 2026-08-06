@@ -166,6 +166,12 @@ class TrainConfig:
     num_motion_bases: int = 40
     num_fine_bases: int = 30
     cluster_init_type: str = "means"
+    # only used when cluster_init_type == "motion_affinity"
+    affinity_k: int = 12
+    affinity_cut_percentile: float = 85.0  # only used when affinity_method == "components"
+    affinity_min_cluster_size: int = 20
+    affinity_method: str = "agglomerative"
+    affinity_n_clusters: int = 40  # only used when affinity_method == "agglomerative"
 
     # Training
     num_glob_epochs: int = 400
