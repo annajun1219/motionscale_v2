@@ -132,6 +132,16 @@ class OptimConfig:
     ### Coefs Initialization
     coefs_type: str = "linear"
     coefs_sigma: float = 0.45
+    ### ARAP rigidity neighbor graph
+    # "euclidean" (default): k Euclidean-nearest cluster centers, exactly the
+    # historical behavior. "connectivity": body-connectivity graph (spatial
+    # adjacency + motion consistency), see flow3d/rigidity_graph.py -- avoids
+    # anchoring a cluster to a spatially-close-but-unrelated one (e.g. the
+    # other hand during a clasped-hands pose).
+    rigidity_graph_type: str = "euclidean"
+    connectivity_spatial_k: int = 12
+    connectivity_min_shared_edges: int = 2
+    connectivity_cv_threshold: float = 0.05
 
 
 @dataclass

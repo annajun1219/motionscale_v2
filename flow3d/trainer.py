@@ -30,6 +30,7 @@ from flow3d.scene_model import SceneModel
 from flow3d.vis.utils import get_server
 from flow3d.vis.viewer import DynamicViewer
 from flow3d.init_utils import cluster_by_velocities, init_motion_params_for_split
+from flow3d.rigidity_graph import build_body_connectivity_graph, log_connectivity_graph
 from sklearn.cluster import AgglomerativeClustering
 
 
@@ -77,6 +78,9 @@ class Trainer:
             "max_radii": torch.zeros(self.model.num_gaussians, device=device),
         }
         self.knn_idx, self.rigid_weights = None, None
+        # cached body-connectivity graph (rigidity_graph_type="connectivity"):
+        # built once from the fixed cluster assignment, never rebuilt during training.
+        self.connectivity_knn_idx, self.connectivity_valid_mask = None, None
 
         self.work_dir = work_dir
         self.writer = SummaryWriter(log_dir=work_dir)
@@ -1286,11 +1290,37 @@ class Trainer:
             torch.arange(num_frames, device=self.device), freeze_centers=True,
         )  # (C, T, 3)
 
-        # compute knn graph
-        points_ref = all_tracks[:, 0]  # (C, 3)
-        dists = torch.cdist(points_ref, points_ref)
-        _, knn_idx = dists.topk(k + 1, largest=False)
-        self.knn_idx = knn_idx[:, 1:]  # (C, k)
+        graph_type = self.optim_cfg.rigidity_graph_type
+        if graph_type == "connectivity":
+            # graph structure is fixed for the whole run: build it once from the
+            # (fixed) cluster assignment, then only refresh the edge weights.
+            if self.connectivity_knn_idx is None:
+                cluster_ids = self.model.fg.get_cluster_ids().reshape(-1).long()
+                means_cano = self.model.fg.params["means"]
+                self.connectivity_knn_idx, self.connectivity_valid_mask = build_body_connectivity_graph(
+                    means_cano=means_cano,
+                    cluster_ids=cluster_ids,
+                    centers_ts=all_tracks,
+                    num_clusters=self.model.motion_bases.num_clusters,
+                    spatial_k=self.optim_cfg.connectivity_spatial_k,
+                    min_shared_edges=self.optim_cfg.connectivity_min_shared_edges,
+                    cv_threshold=self.optim_cfg.connectivity_cv_threshold,
+                )
+                log_connectivity_graph(self.connectivity_knn_idx, self.connectivity_valid_mask)
+
+            knn_idx = self.connectivity_knn_idx
+            valid_mask = self.connectivity_valid_mask
+        elif graph_type == "euclidean":
+            # compute knn graph
+            points_ref = all_tracks[:, 0]  # (C, 3)
+            dists = torch.cdist(points_ref, points_ref)
+            _, knn_idx = dists.topk(k + 1, largest=False)
+            knn_idx = knn_idx[:, 1:]  # (C, k)
+            valid_mask = None
+        else:
+            raise ValueError(f"Unknown rigidity_graph_type: {graph_type}")
+
+        self.knn_idx = knn_idx
 
         # lengths inside local neighbors
         neighbors_all = all_tracks[self.knn_idx]  # (C, k, T, 3)
@@ -1300,7 +1330,13 @@ class Trainer:
         # std of the lengths over time
         lengths_std = lengths_all.std(dim=-1, unbiased=False)  # (C, k)
         rel = lengths_std / (lengths_mean.clamp_min(eps))  # (C, k)
-        self.rigid_weights = torch.exp(-(rel ** 2) / (2 * sigma_rel ** 2))  # (C, k)
+        rigid_weights = torch.exp(-(rel ** 2) / (2 * sigma_rel ** 2))  # (C, k)
+        if valid_mask is not None:
+            # padded (self-index) slots carry zero weight -> zero contribution
+            # to compute_arap_distance_loss, matching a cluster with no valid
+            # connectivity neighbor.
+            rigid_weights = rigid_weights * valid_mask.float()
+        self.rigid_weights = rigid_weights
 
 
     @torch.no_grad()
@@ -1540,6 +1576,11 @@ class Trainer:
             (self.knn_idx is not None and self.rigid_weights is not None)
             and (num_bases_split > 0 or num_bases_culled > 0)
         ):
+            # cluster ids/count just changed (split/cull/remap) -- a cached
+            # connectivity graph is now stale (wrong or out-of-range cluster
+            # indices), so force a rebuild. Euclidean mode already rebuilds
+            # knn_idx from scratch every call and needs no such reset.
+            self.connectivity_knn_idx, self.connectivity_valid_mask = None, None
             self.update_rigidity_weights()
 
     @torch.no_grad()
