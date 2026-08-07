@@ -669,7 +669,7 @@ class Trainer:
             rigid_body_loss = compute_arap_distance_loss(
                 centers_ts, ref_t=0, knn_idx=self.knn_idx, weights=self.rigid_weights, detach_ref=True,
             )
-            loss += rigid_body_loss * 0.5
+            loss += rigid_body_loss * self.losses_cfg.w_rigidity
 
         # Prepare stats for logging.
         stats = {
@@ -1034,6 +1034,26 @@ class Trainer:
         loss_coarse_align = masked_l1_loss(pos_coarse, positions)
         loss += loss_coarse_align * self.losses_cfg.w_coarse_align
 
+        ## Rigidity loss (ARAP). update_rigidity_weights() is normally only
+        ## triggered as a side effect of _bases_control_step, so this only
+        ## ever fires once basis control has been explicitly disabled and
+        ## control_step() has populated knn_idx/rigid_weights itself -- this
+        ## keeps default (bases-control-on) runs byte-for-byte unaffected.
+        rigid_body_loss = torch.tensor(0.0, device=device)
+        if (
+            not self.optim_cfg.enable_bases_control
+            and self.knn_idx is not None
+            and self.rigid_weights is not None
+        ):
+            ref_t = 0
+            target_t = target_ts[0][0].item()  # one target frame is enough for the ARAP graph
+            frame_ids = torch.tensor([ref_t, target_t], device=device)
+            centers_ts = self.model.motion_bases.get_centers(frame_ids, freeze_centers=True)  # (C, T, 3)
+            rigid_body_loss = compute_arap_distance_loss(
+                centers_ts, ref_t=0, knn_idx=self.knn_idx, weights=self.rigid_weights, detach_ref=True,
+            )
+            loss += rigid_body_loss * self.losses_cfg.w_rigidity
+
         # Prepare stats for logging.
         stats = {
             "train/loss": loss.item(),
@@ -1053,6 +1073,7 @@ class Trainer:
             "train/z_accel_loss": z_accel_loss.item(),
             "train/loss_center_cano": loss_center_cano.item(),
             "train/loss_coarse_align": loss_coarse_align.item(),
+            "train/rigid_body_loss": rigid_body_loss.item(),
             "train/num_gaussians": self.model.num_gaussians,
             "train/num_fg_gaussians": self.model.num_fg_gaussians,
             "train/num_bg_gaussians": self.model.num_bg_gaussians,
@@ -1164,13 +1185,34 @@ class Trainer:
         """
         cfg = self.optim_cfg
 
-        # control bases
-        if (
+        is_bases_control_interval = (
             step >= cfg.start_control_steps
             and step < cfg.stop_control_steps
             and (step + 1) % cfg.control_bases_every == cfg.control_bases_offset
-        ):
+        )
+
+        # control bases
+        if cfg.enable_bases_control and is_bases_control_interval:
             self._bases_control_step(step)
+
+        if is_bases_control_interval:
+            guru.info(
+                f"[control] {step=} num_clusters={self.model.motion_bases.num_clusters} "
+                f"(bases_control={'ON' if cfg.enable_bases_control else 'OFF'})"
+            )
+
+        # rigidity refresh: normally a side effect of _bases_control_step, so
+        # when basis control is disabled it must be driven explicitly instead.
+        if not cfg.enable_bases_control:
+            if self.knn_idx is None:
+                self.update_rigidity_weights()
+                guru.info(f"[rigidity] Initial rigidity weights computed at {step=}.")
+            elif (
+                cfg.rigidity_refresh_every > 0
+                and (step + 1) % cfg.rigidity_refresh_every == 0
+            ):
+                self.update_rigidity_weights()
+                guru.info(f"[rigidity] Refreshed rigidity weights at {step=}.")
 
         # densify and cull
         if (

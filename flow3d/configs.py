@@ -92,6 +92,7 @@ class LossesConfig:
     w_center_cano: float = 1.0
     w_center_coarse: float = 1.0
     w_coarse_align: float = 0.1
+    w_rigidity: float = 0.5
     use_log_scale_var: bool = True
 
 
@@ -116,9 +117,11 @@ class OptimConfig:
     cull_scale_threshold: float = 0.5
     cull_screen_threshold: float = 0.15
     ## Motion bases control
+    enable_bases_control: bool = True
     start_control_steps: int = 150
     control_bases_every: int = 50
     control_bases_offset: int = 30
+    rigidity_refresh_every: int = 50
     max_num_bases: int = 100
     split_bases_threshold: float = 0.005
     cull_bases_threshold: float = 0.003
