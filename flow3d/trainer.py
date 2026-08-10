@@ -1878,7 +1878,14 @@ class Trainer:
         for name, params in self.model.named_parameters():
             name_fields = name.split(".")
             part, field = name_fields[0], name_fields[-1]
-            lr = lr_dict[part][field]
+            if len(name_fields) > 1 and name_fields[1] == "gnn":
+                # flow3d/graph_coupling.py: GraphCorrectedScalableMotionBases's
+                # GNN params (e.g. "motion_bases.gnn.encoder.0.weight") aren't a
+                # "part.params.field" leaf, so they're not in lr_dict -- give
+                # them their own fixed-lr param group instead.
+                lr = self.optim_cfg.gnn_lr
+            else:
+                lr = lr_dict[part][field]
             optim = torch.optim.Adam([{"params": params, "lr": lr, "name": name}])
 
             if "scales" in name:

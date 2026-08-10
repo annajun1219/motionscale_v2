@@ -150,6 +150,11 @@ class OptimConfig:
     connectivity_spatial_k: int = 12
     connectivity_min_shared_edges: int = 2
     connectivity_cv_threshold: float = 0.05
+    ### Graph-coupled cluster GNN (see flow3d/graph_coupling.py)
+    # learning rate for the GNN's own parameters (encoder/message-passing/head);
+    # these don't appear in SceneLRConfig since they're not a "fg"/"bg"/"motion_bases"
+    # leaf param, so Trainer.configure_optimizers gives them their own param group.
+    gnn_lr: float = 1e-3
 
 
 @dataclass
@@ -193,6 +198,23 @@ class TrainConfig:
     affinity_min_cluster_size: int = 20
     affinity_method: str = "agglomerative"
     affinity_n_clusters: int = 40  # only used when affinity_method == "agglomerative"
+
+    ### Graph-coupled cluster GNN (see flow3d/graph_coupling.py)
+    # Wraps motion_bases in GraphCorrectedScalableMotionBases: a GNN mixes each
+    # cluster's coarse (global) rotation/translation with its graph neighbors'
+    # and predicts a zero-init residual correction, composed onto the coarse
+    # transform (rotation via so(3) compose, translation via add). Intended to
+    # keep e.g. a hand cluster coordinated with its own forearm instead of
+    # drifting into the other hand's identity. Only the coarse transform is
+    # touched; fine (local) motion is untouched.
+    # Requires --optim.no-enable-bases-control (the cluster set -- and hence
+    # the graph topology -- must stay fixed for the whole run) and a fixed
+    # cluster graph built offline by flow3d/analysis/build_cluster_graph.py
+    # (same edges.pt format read by optim.rigidity_graph_path).
+    enable_graph_coupling: bool = False
+    graph_coupling_path: str | None = None
+    gnn_hidden: int = 128
+    gnn_layers: int = 2
 
     # Training
     num_glob_epochs: int = 400

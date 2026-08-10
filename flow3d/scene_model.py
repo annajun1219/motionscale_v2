@@ -246,6 +246,16 @@ class SceneModel(nn.Module):
             motion_bases = GraphCorrectedScalableMotionBases.init_from_state_dict(
                 state_dict, prefix=f"{prefix}motion_bases."
             )
+        elif any(f"{prefix}motion_bases.gnn." in k for k in state_dict):
+            # flow3d/graph_coupling.py: coarse transform is corrected by a
+            # mean-aggregation message-passing GNN on top of a ScalableMotionBases.
+            # Same reasoning as above -- the correction lives in the "gnn"
+            # submodule, not in params, so it must be reconstructed explicitly.
+            from flow3d.graph_coupling import GraphCorrectedScalableMotionBases
+
+            motion_bases = GraphCorrectedScalableMotionBases.init_from_state_dict(
+                state_dict, prefix=f"{prefix}motion_bases."
+            )
         elif f"{prefix}motion_bases.params.fine_rots" in state_dict:
             motion_bases = ScalableMotionBases.init_from_state_dict(state_dict, prefix=f"{prefix}motion_bases.params.")
         else:

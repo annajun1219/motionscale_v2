@@ -321,6 +321,36 @@ def initialize_and_checkpoint_model(
         server = get_server(port=cfg.port)
         vis_init_params(server, fg_params, motion_bases)
 
+    if cfg.enable_graph_coupling:
+        assert not cfg.optim.enable_bases_control, (
+            "enable_graph_coupling requires --optim.no-enable-bases-control: "
+            "bases split/cull would remap cluster ids that the graph topology "
+            "doesn't know about."
+        )
+        assert cfg.graph_coupling_path, (
+            "enable_graph_coupling=True requires --graph_coupling_path to point "
+            "to an edges.pt built by flow3d/analysis/build_cluster_graph.py."
+        )
+        from flow3d.graph_coupling import (
+            GraphCorrectedScalableMotionBases,
+            build_edge_index_from_edges_pt,
+        )
+
+        edge_index = build_edge_index_from_edges_pt(
+            cfg.graph_coupling_path, num_clusters=motion_bases.num_clusters
+        )
+        motion_bases = GraphCorrectedScalableMotionBases.from_scalable_motion_bases(
+            motion_bases,
+            edge_index=edge_index,
+            gnn_hidden_dim=cfg.gnn_hidden,
+            gnn_num_layers=cfg.gnn_layers,
+        ).to(device)
+        guru.info(
+            f"Graph coupling enabled: wrapped motion_bases with GNN "
+            f"(hidden={cfg.gnn_hidden}, layers={cfg.gnn_layers}, "
+            f"edges={edge_index.shape[1]}, from {cfg.graph_coupling_path})"
+        )
+
     # Initialize scene model — camera poses only for init frames, new frames added during propagation
     camera_poses = init_trainable_poses(w2cs_init)
     model = SceneModel(Ks, w2cs, fg_params, motion_bases, bg_params, shad_params, shad_bases, camera_poses=camera_poses, use_2dgs=use_2dgs)
