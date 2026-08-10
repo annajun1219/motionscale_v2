@@ -376,21 +376,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--candidate-radius-multiplier", type=float, default=30.0)
     parser.add_argument(
-        "--center-gate-max-median-distance",
+        "--center-gate-max-median-p10-ratio",
         type=float,
-        default=0.4,
+        default=ClusterGraphConfig().center_gate_max_median_to_p10_ratio,
         help="Sanity gate: a pair is cut outright if its cluster CENTERS' "
-        "median distance across the whole sequence exceeds this, independent "
-        "of the boundary-gap check. Deliberately loose/median-based (not the "
-        "closest-approach frame) so a pair that's apart most of the clip but "
-        "has one real brief touch is left alone -- only meant to catch pairs "
-        "essentially never in the same vicinity, where a small boundary-gap "
-        "reading is almost certainly a min-over-many-noisy-candidate-pairs "
+        "median distance across the whole sequence exceeds this many times "
+        "their 10th-percentile distance, independent of the boundary-gap "
+        "check. Relative rather than an absolute distance, so it doesn't "
+        "need recalibrating per checkpoint/scene scale. Compares against "
+        "the p10 distance rather than the single closest-approach frame -- "
+        "a one-frame min lets an articulated real neighbor's centroids swing "
+        "close together at one arbitrary pose purely by chance and wrongly "
+        "inflate the ratio, even while its boundary stays touching every "
+        "frame; p10 is the closest-approach *regime*, not one lucky frame. "
+        "A pair that stays close throughout (small ratio) passes through to "
+        "the gap check; a pair whose closest-approach regime is rare "
+        "relative to its typical separation (large ratio) is cut here -- "
+        "indistinguishable from the min-over-many-noisy-candidate-pairs "
         "artifact (a large candidate-point pool always contains SOME near "
-        "pair by chance). Calibrate per checkpoint/scene scale: on one "
-        "checkpoint a real (brief) touch had median center distance 0.27, a "
-        "confirmed-never-touching pair sat at 0.44 -- set this between two "
-        "such reference pairs of your own, not blindly.",
+        "pair by chance) this gate exists to catch.",
     )
     parser.add_argument("--keep-multiplier", type=float, default=1.5)
     parser.add_argument(
@@ -399,20 +403,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=5,
         help="Frames per confidence-weighted smoothing window applied to the "
         "per-frame gap sequence before taking its max (the keep/cut summary "
-        "statistic). 1 disables windowed smoothing (confidence gating still "
-        "applies). Higher = more tolerant of transient noise/occlusion, at "
-        "the cost of blurring genuinely short separations.",
+        "statistic) -- every frame contributes, weighted by its own "
+        "confidence, none are dropped. 1 disables windowed smoothing "
+        "(falls back to the raw, unweighted max). Higher = more tolerant of "
+        "transient noise/occlusion, at the cost of blurring genuinely short "
+        "separations.",
     )
     parser.add_argument(
         "--gap-confidence-threshold",
         type=float,
         default=0.5,
-        help="Hard gate: a frame with confidence_t below this is dropped "
-        "entirely from the gap sequence before smoothing/max, not just "
-        "down-weighted. Matches flow3d/data/utils.py's "
-        "parse_cotracker3_track_info visibility*confidence>0.5 gate used at "
-        "training time, applied here to the same per-point confidence "
-        "values. No effect when confidences_all_frames is None (learned "
+        help="Diagnostic-only cutoff: frames with confidence_t below this "
+        "are reported via the gap_low_confidence_frac column, but no longer "
+        "dropped from the gap computation (that hard gate silently discarded "
+        "exactly the frames that would show a real separation whenever those "
+        "frames also happened to be low-confidence). Confidence now only "
+        "downweights a frame within --gap-smoothing-window or feeds this "
+        "diagnostic. No effect when confidences_all_frames is None (learned "
         "position source).",
     )
     parser.add_argument(
@@ -511,8 +518,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--spacing-sample-limit must be >= 1")
     if args.candidate_radius_multiplier <= 0:
         raise ValueError("--candidate-radius-multiplier must be > 0")
-    if args.center_gate_max_median_distance <= 0:
-        raise ValueError("--center-gate-max-median-distance must be > 0")
+    if args.center_gate_max_median_p10_ratio <= 0:
+        raise ValueError("--center-gate-max-median-p10-ratio must be > 0")
     if args.keep_multiplier <= 0:
         raise ValueError("--keep-multiplier must be > 0")
     if args.gap_smoothing_window < 1:
@@ -808,11 +815,13 @@ def _edge_to_dict(e: ClusterPairEdge, frame_offset: int = 0) -> dict[str, Any]:
         "frame_t_star": int(e.frame_t_star) + frame_offset,
         "center_distance_t_star": float(e.center_distance_t_star),
         "center_distance_median": float(e.center_distance_median),
+        "center_distance_p10": float(e.center_distance_p10),
         "gap_summary": float(e.gap_summary),
         "gap_median": float(e.gap_median),
         "gap_min": float(e.gap_min),
         "gap_max": float(e.gap_max),
         "gap_mean_confidence": float(e.gap_mean_confidence),
+        "gap_low_confidence_frac": float(e.gap_low_confidence_frac),
         "num_boundary_a": int(e.num_boundary_a),
         "num_boundary_b": int(e.num_boundary_b),
         "boundary_global_indices_a": torch.from_numpy(e.boundary_global_indices_a).long(),
@@ -978,7 +987,7 @@ def main() -> None:
 
     config = ClusterGraphConfig(
         candidate_radius_multiplier=args.candidate_radius_multiplier,
-        center_gate_max_median_distance=args.center_gate_max_median_distance,
+        center_gate_max_median_to_p10_ratio=args.center_gate_max_median_p10_ratio,
         keep_multiplier=args.keep_multiplier,
         gap_smoothing_window=args.gap_smoothing_window,
         gap_confidence_threshold=args.gap_confidence_threshold,
