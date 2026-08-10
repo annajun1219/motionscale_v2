@@ -81,6 +81,9 @@ class Trainer:
         # cached body-connectivity graph (rigidity_graph_type="connectivity"):
         # built once from the fixed cluster assignment, never rebuilt during training.
         self.connectivity_knn_idx, self.connectivity_valid_mask = None, None
+        # cached offline cluster graph (rigidity_graph_type="cluster_graph_file"):
+        # loaded once from optim_cfg.rigidity_graph_path, never rebuilt during training.
+        self.cluster_graph_knn_idx, self.cluster_graph_valid_mask = None, None
 
         self.work_dir = work_dir
         self.writer = SummaryWriter(log_dir=work_dir)
@@ -1282,6 +1285,52 @@ class Trainer:
             self.running_stats["max_radii"].index_put_((gidcs,), max_radii)
         return True
 
+    def _load_cluster_graph_file(
+        self, path: str, num_clusters: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Load flow3d/analysis/build_cluster_graph.py's edges.pt and pad it to
+        the same (C, max_degree) knn_idx/valid_mask convention
+        build_body_connectivity_graph returns, so the rest of
+        update_rigidity_weights doesn't care which source built the graph.
+
+        edges.pt's cluster ids are 0-indexed against the checkpoint it was
+        built from (model.fg.get_cluster_ids()), the same indexing
+        motion_bases uses -- but only valid as long as the cluster set hasn't
+        changed since (bases split/cull remaps cluster ids), hence the
+        num_clusters check below.
+        """
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        graph_cluster_ids = payload["cluster_ids"]
+        if graph_cluster_ids and max(graph_cluster_ids) >= num_clusters:
+            raise ValueError(
+                f"{path} was built for cluster ids up to {max(graph_cluster_ids)}, but the "
+                f"model currently has {num_clusters} clusters (0..{num_clusters - 1}) -- "
+                "cluster_graph_file requires the cluster set to stay exactly as it was when "
+                "the graph was built. Pass --optim.no-enable-bases-control."
+            )
+
+        neighbors: list[list[int]] = [[] for _ in range(num_clusters)]
+        for e in payload["edges_kept"]:
+            a, b = int(e["cluster_a"]), int(e["cluster_b"])
+            neighbors[a].append(b)
+            neighbors[b].append(a)
+
+        max_degree = max(1, max((len(n) for n in neighbors), default=1))
+        knn_idx = torch.arange(num_clusters, device=self.device).unsqueeze(1).repeat(1, max_degree)
+        valid_mask = torch.zeros((num_clusters, max_degree), dtype=torch.bool, device=self.device)
+        for c, ns in enumerate(neighbors):
+            if not ns:
+                continue
+            knn_idx[c, : len(ns)] = torch.tensor(ns, device=self.device, dtype=torch.long)
+            valid_mask[c, : len(ns)] = True
+
+        guru.info(
+            f"[rigidity] loaded cluster graph file: {path} "
+            f"(kept_edges={len(payload['edges_kept'])}, cut_edges={len(payload.get('edges_cut', []))})"
+        )
+        return knn_idx, valid_mask
+
     @torch.no_grad()
     def update_rigidity_weights(self, k=5, sigma_rel=0.05, eps=1e-6):
         # get all tracks
@@ -1310,6 +1359,25 @@ class Trainer:
 
             knn_idx = self.connectivity_knn_idx
             valid_mask = self.connectivity_valid_mask
+        elif graph_type == "cluster_graph_file":
+            # graph structure comes from an offline edges.pt (see
+            # flow3d/analysis/build_cluster_graph.py, typically run with
+            # --position-source raw_tracks so it isn't corrupted by the same
+            # learned-motion swaps rigidity is meant to prevent): load and
+            # pad it once, then only refresh the edge weights.
+            if self.cluster_graph_knn_idx is None:
+                if not self.optim_cfg.rigidity_graph_path:
+                    raise ValueError(
+                        "rigidity_graph_type='cluster_graph_file' requires optim_cfg.rigidity_graph_path."
+                    )
+                self.cluster_graph_knn_idx, self.cluster_graph_valid_mask = self._load_cluster_graph_file(
+                    self.optim_cfg.rigidity_graph_path,
+                    num_clusters=self.model.motion_bases.num_clusters,
+                )
+                log_connectivity_graph(self.cluster_graph_knn_idx, self.cluster_graph_valid_mask)
+
+            knn_idx = self.cluster_graph_knn_idx
+            valid_mask = self.cluster_graph_valid_mask
         elif graph_type == "euclidean":
             # compute knn graph
             points_ref = all_tracks[:, 0]  # (C, 3)
@@ -1577,10 +1645,15 @@ class Trainer:
             and (num_bases_split > 0 or num_bases_culled > 0)
         ):
             # cluster ids/count just changed (split/cull/remap) -- a cached
-            # connectivity graph is now stale (wrong or out-of-range cluster
-            # indices), so force a rebuild. Euclidean mode already rebuilds
-            # knn_idx from scratch every call and needs no such reset.
+            # connectivity or cluster-graph-file graph is now stale (wrong or
+            # out-of-range cluster indices), so force a rebuild. Euclidean
+            # mode already rebuilds knn_idx from scratch every call and needs
+            # no such reset. cluster_graph_file's rebuild will raise if the
+            # new cluster count no longer matches the offline graph -- that
+            # combination (bases control + a fixed offline graph) isn't
+            # supported, use --optim.no-enable-bases-control instead.
             self.connectivity_knn_idx, self.connectivity_valid_mask = None, None
+            self.cluster_graph_knn_idx, self.cluster_graph_valid_mask = None, None
             self.update_rigidity_weights()
 
     @torch.no_grad()

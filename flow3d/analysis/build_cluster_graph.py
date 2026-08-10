@@ -375,6 +375,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spacing-sample-limit", type=int, default=20000)
 
     parser.add_argument("--candidate-radius-multiplier", type=float, default=30.0)
+    parser.add_argument(
+        "--center-gate-max-median-distance",
+        type=float,
+        default=0.4,
+        help="Sanity gate: a pair is cut outright if its cluster CENTERS' "
+        "median distance across the whole sequence exceeds this, independent "
+        "of the boundary-gap check. Deliberately loose/median-based (not the "
+        "closest-approach frame) so a pair that's apart most of the clip but "
+        "has one real brief touch is left alone -- only meant to catch pairs "
+        "essentially never in the same vicinity, where a small boundary-gap "
+        "reading is almost certainly a min-over-many-noisy-candidate-pairs "
+        "artifact (a large candidate-point pool always contains SOME near "
+        "pair by chance). Calibrate per checkpoint/scene scale: on one "
+        "checkpoint a real (brief) touch had median center distance 0.27, a "
+        "confirmed-never-touching pair sat at 0.44 -- set this between two "
+        "such reference pairs of your own, not blindly.",
+    )
     parser.add_argument("--keep-multiplier", type=float, default=1.5)
     parser.add_argument(
         "--gap-smoothing-window",
@@ -385,6 +402,31 @@ def build_parser() -> argparse.ArgumentParser:
         "statistic). 1 disables windowed smoothing (confidence gating still "
         "applies). Higher = more tolerant of transient noise/occlusion, at "
         "the cost of blurring genuinely short separations.",
+    )
+    parser.add_argument(
+        "--gap-confidence-threshold",
+        type=float,
+        default=0.5,
+        help="Hard gate: a frame with confidence_t below this is dropped "
+        "entirely from the gap sequence before smoothing/max, not just "
+        "down-weighted. Matches flow3d/data/utils.py's "
+        "parse_cotracker3_track_info visibility*confidence>0.5 gate used at "
+        "training time, applied here to the same per-point confidence "
+        "values. No effect when confidences_all_frames is None (learned "
+        "position source).",
+    )
+    parser.add_argument(
+        "--gap-skip-first-n-frames",
+        type=int,
+        default=0,
+        help="Drop the first N frames from candidate/gap computation entirely "
+        "(cluster centers, boundary selection, and the per-frame gap "
+        "sequence all skip them, for both position sources) -- for a clip "
+        "whose earliest frames have unreliable raw-track/depth lifting (e.g. "
+        "a tracking-window warm-up artifact) that reads as a false "
+        "separation between parts that are actually touching there. "
+        "Confirmed by visual inspection of the affected frames, not applied "
+        "blindly.",
     )
 
     parser.add_argument("--boundary-fraction", type=float, default=0.10)
@@ -469,10 +511,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--spacing-sample-limit must be >= 1")
     if args.candidate_radius_multiplier <= 0:
         raise ValueError("--candidate-radius-multiplier must be > 0")
+    if args.center_gate_max_median_distance <= 0:
+        raise ValueError("--center-gate-max-median-distance must be > 0")
     if args.keep_multiplier <= 0:
         raise ValueError("--keep-multiplier must be > 0")
     if args.gap_smoothing_window < 1:
         raise ValueError("--gap-smoothing-window must be >= 1")
+    if not 0 <= args.gap_confidence_threshold <= 1:
+        raise ValueError("--gap-confidence-threshold must be in [0, 1]")
+    if args.gap_skip_first_n_frames < 0:
+        raise ValueError("--gap-skip-first-n-frames must be >= 0")
     if not 0 < args.boundary_fraction <= 1:
         raise ValueError("--boundary-fraction must be in (0, 1]")
     if args.boundary_min_gaussians < 1:
@@ -545,7 +593,7 @@ def load_model_and_clusters(
 
 def _greedy_unique_match(
     query_points: np.ndarray, pool_points: np.ndarray, k: int = 12
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Nearest-neighbor match query_points -> pool_points, but greedily enforce
     a *unique* pool assignment (no two query points share a pool point).
@@ -556,11 +604,16 @@ def _greedy_unique_match(
     points matching the identical raw track, i.e. gap_summary == 0.0 for every
     frame by construction, not because they're actually touching. Greedily
     claiming each query point's best *available* candidate among its k
-    nearest removes that artifact at the source (falls back to the plain
-    nearest, ignoring uniqueness, only if all k candidates are already
-    claimed -- reported via the returned unresolved count in the caller's log).
+    nearest removes that artifact at the source. A query point whose k
+    nearest candidates are all already claimed is left UNMATCHED rather than
+    falling back to a duplicate: forcing a match there is exactly what
+    creates the exact-position collision this function exists to prevent
+    (confirmed cause of the cluster-33 false edges -- 13/1760 and 1/1861
+    Gaussians shared a bit-identical raw-track trajectory with another
+    cluster). The caller drops unmatched points from the graph entirely.
 
-    :return: (match_dist, match_idx), each (len(query_points),).
+    :return: (match_dist, match_idx, matched), each (len(query_points),).
+        match_dist/match_idx are only meaningful where matched[i] is True.
     """
     tree = cKDTree(pool_points)
     k_eff = min(k, len(pool_points))
@@ -573,7 +626,7 @@ def _greedy_unique_match(
     claimed = np.zeros(len(pool_points), dtype=bool)
     match_idx = np.full(len(query_points), -1, dtype=np.int64)
     match_dist = np.full(len(query_points), np.inf, dtype=np.float64)
-    unresolved: list[int] = []
+    matched = np.zeros(len(query_points), dtype=bool)
 
     for qi in order:
         for rank in range(k_eff):
@@ -582,33 +635,28 @@ def _greedy_unique_match(
                 claimed[pi] = True
                 match_idx[qi] = pi
                 match_dist[qi] = dists[qi, rank]
+                matched[qi] = True
                 break
-        else:
-            unresolved.append(int(qi))
 
-    for qi in unresolved:
-        match_idx[qi] = int(idxs[qi, 0])
-        match_dist[qi] = dists[qi, 0]
-
-    if unresolved:
+    num_unmatched = int((~matched).sum())
+    if num_unmatched:
         print(
-            f"[raw_tracks] {len(unresolved)}/{len(query_points)} Gaussians had all "
+            f"[raw_tracks] {num_unmatched}/{len(query_points)} Gaussians had all "
             f"{k_eff} nearest raw-track candidates already claimed by another Gaussian; "
-            f"fell back to the nearest one anyway (still a possible collision -- raise k "
-            f"or the track pool size if this count is large)"
+            f"EXCLUDED from the graph (no forced duplicate match) -- raise k or the "
+            f"track pool size if this count is large"
         )
 
-    return match_dist, match_idx
+    return match_dist, match_idx, matched
 
 
 def load_raw_track_positions(
     work_dir: Path,
     clusters: list[ClusterInfo],
-    num_frames: int,
     num_query_frames: int = 20,
     num_samples_per_query: int = 20000,
     max_match_distance: float | None = None,
-) -> tuple[np.ndarray, np.ndarray, dict[int, np.ndarray]]:
+) -> tuple[np.ndarray, np.ndarray, dict[int, np.ndarray], int]:
     """
     Per-frame positions (and per-frame confidences) from raw (pre-motion-basis)
     2D-lifted tracks, as an alternative to model.compute_poses_fg's *learned*
@@ -638,14 +686,19 @@ def load_raw_track_positions(
     sized.
 
     :param clusters: only clusters actually needed (already min-size-filtered).
-    :param num_frames: must match the model's num_frames -- raw tracks are
-        loaded for the full [0, num_frames) range so both position sources
-        cover identical frames.
-    :return: (positions_all_frames, confidences_all_frames, global_indices_by_cluster).
-        Indices are LOCAL to the returned (N, T, ...) arrays (N = sum of
-        cluster sizes), not the original fg Gaussian ids -- these arrays only
-        cover the clusters passed in, unlike the full-G array
-        compute_poses_fg produces.
+        Only model.fg (canonical means + cluster ids) is used here, both
+        frame-count-independent, so this works against a checkpoint that
+        hasn't been frame-propagated at all yet (e.g. straight out of init) --
+        raw tracks come from the dataset's own cached track files, not from
+        the model's motion bases, so the graph can cover the *full* video
+        even when the model currently only spans its init window.
+    :return: (positions_all_frames, confidences_all_frames,
+        global_indices_by_cluster, num_frames). Indices are LOCAL to the
+        returned (N, T, ...) arrays (N = sum of cluster sizes), not the
+        original fg Gaussian ids -- these arrays only cover the clusters
+        passed in, unlike the full-G array compute_poses_fg produces.
+        num_frames is dataset.num_frames (the full video length), returned so
+        the caller can log/record it instead of assuming it up front.
     """
     from flow3d.data.casual_dataset import CasualDataset
     from flow3d.data.utils import get_tracks_3d_for_query_frame
@@ -658,11 +711,7 @@ def load_raw_track_positions(
     data_cfg["load_from_cache"] = True
 
     dataset = CasualDataset(**data_cfg)
-    if dataset.num_frames != num_frames:
-        raise RuntimeError(
-            f"Dataset has {dataset.num_frames} frames but the model has "
-            f"{num_frames}; --position-source raw_tracks requires them to match."
-        )
+    num_frames = dataset.num_frames
 
     target_idcs = list(range(num_frames))
     masks = torch.stack([dataset.get_mask(i) for i in target_idcs], dim=0)
@@ -700,53 +749,65 @@ def load_raw_track_positions(
     all_canonical = (
         torch.cat([c.canonical_points for c in clusters], dim=0).detach().float().cpu().numpy()
     )
-    match_dist, match_idx = _greedy_unique_match(all_canonical, cano_xyz, k=12)
+    match_dist, match_idx, matched = _greedy_unique_match(all_canonical, cano_xyz, k=12)
 
     if max_match_distance is not None:
-        bad = match_dist > max_match_distance
+        bad = matched & (match_dist > max_match_distance)
         if bad.any():
             print(
-                f"[raw_tracks] warning: {int(bad.sum())}/{len(bad)} cluster Gaussians "
-                f"matched a raw track >{max_match_distance:.6f} away (unreliable match, "
+                f"[raw_tracks] warning: {int(bad.sum())}/{int(matched.sum())} matched cluster "
+                f"Gaussians matched a raw track >{max_match_distance:.6f} away (unreliable match, "
                 f"used anyway -- nearest available)"
             )
 
-    positions_all_frames = xyz[match_idx]  # (sum(cluster sizes), T, 3)
-    confidences_all_frames = pool_confidences[match_idx]  # (sum(cluster sizes), T)
+    # Points with no free pool track to claim are dropped entirely (see
+    # _greedy_unique_match) rather than forced onto a duplicate -- so
+    # match_idx is now injective on the kept subset and no two Gaussians can
+    # end up with an exact-identical trajectory (the cluster-33 false-edge
+    # cause) by construction.
+    kept_idx = match_idx[matched]
+    positions_all_frames = xyz[kept_idx]  # (num_matched, T, 3)
+    confidences_all_frames = pool_confidences[kept_idx]  # (num_matched, T)
     print(
         f"[raw_tracks] pooled {cano_xyz.shape[0]} raw tracks from {len(query_frames)} query "
-        f"frames {query_frames}; matched {len(all_canonical)} cluster Gaussians to "
-        f"{len(np.unique(match_idx))} distinct tracks "
-        f"(median match distance {float(np.median(match_dist)):.6f}, "
+        f"frames {query_frames}; matched {int(matched.sum())}/{len(all_canonical)} cluster "
+        f"Gaussians to distinct tracks (dropped {int((~matched).sum())} with no free track to "
+        f"claim; median match distance {float(np.median(match_dist[matched])):.6f}, "
         f"mean track confidence {float(confidences_all_frames.mean()):.3f})"
     )
-    if len(np.unique(match_idx)) < len(all_canonical):
-        dup_frac = 1.0 - len(np.unique(match_idx)) / len(all_canonical)
-        print(
-            f"[raw_tracks] {dup_frac:.1%} of matches are duplicates of another Gaussian's match "
-            f"-- raise --raw-track-num-query-frames / --raw-track-samples-per-query if that's high; "
-            f"a KEEP edge with gap_summary == 0.0 in the per-edge log came from a collision like this, "
-            f"not measured contact."
-        )
 
     global_indices_by_cluster: dict[int, np.ndarray] = {}
     offset = 0
+    cluster_start = 0
     for cluster in clusters:
         n = cluster.size
-        global_indices_by_cluster[cluster.cluster_id] = np.arange(offset, offset + n, dtype=np.int64)
-        offset += n
+        cluster_matched = matched[cluster_start : cluster_start + n]
+        num_kept = int(cluster_matched.sum())
+        if num_kept == 0:
+            raise RuntimeError(
+                f"cluster {cluster.cluster_id}: all {n} Gaussians were dropped for lacking a "
+                "free raw-track match -- raise --raw-track-num-query-frames / "
+                "--raw-track-samples-per-query to grow the track pool."
+            )
+        global_indices_by_cluster[cluster.cluster_id] = np.arange(offset, offset + num_kept, dtype=np.int64)
+        offset += num_kept
+        cluster_start += n
 
-    return positions_all_frames, confidences_all_frames, global_indices_by_cluster
+    return positions_all_frames, confidences_all_frames, global_indices_by_cluster, num_frames
 
 
-def _edge_to_dict(e: ClusterPairEdge) -> dict[str, Any]:
+def _edge_to_dict(e: ClusterPairEdge, frame_offset: int = 0) -> dict[str, Any]:
     return {
         "cluster_a": int(e.cluster_a),
         "cluster_b": int(e.cluster_b),
         "kept": bool(e.kept),
         "reason": e.reason,
-        "frame_t_star": int(e.frame_t_star),
+        # frame_t_star is an index into the (possibly --gap-skip-first-n-frames
+        # trimmed) sequence build_cluster_graph() saw -- add the offset back so
+        # it reads as the original video's frame number everywhere it's reported.
+        "frame_t_star": int(e.frame_t_star) + frame_offset,
         "center_distance_t_star": float(e.center_distance_t_star),
+        "center_distance_median": float(e.center_distance_median),
         "gap_summary": float(e.gap_summary),
         "gap_median": float(e.gap_median),
         "gap_min": float(e.gap_min),
@@ -761,8 +822,8 @@ def _edge_to_dict(e: ClusterPairEdge) -> dict[str, Any]:
     }
 
 
-def _edge_to_csv_row(e: ClusterPairEdge) -> dict[str, Any]:
-    row = _edge_to_dict(e)
+def _edge_to_csv_row(e: ClusterPairEdge, frame_offset: int = 0) -> dict[str, Any]:
+    row = _edge_to_dict(e, frame_offset)
     row.pop("boundary_global_indices_a")
     row.pop("boundary_global_indices_b")
     return row
@@ -799,12 +860,12 @@ def log_gap_histogram(result: ClusterGraphResult, num_bins: int = 10) -> None:
         print(f"  [{lo:6.2f}, {hi:6.2f}) {count:4d} {'#' * int(count)}")
 
 
-def log_edge_reasons(result: ClusterGraphResult) -> None:
+def log_edge_reasons(result: ClusterGraphResult, frame_offset: int = 0) -> None:
     for e in sorted(result.edges, key=lambda e: (e.cluster_a, e.cluster_b)):
         tag = "KEEP" if e.kept else "CUT "
         print(
             f"[{tag}] {e.cluster_a}-{e.cluster_b} gap_summary={e.gap_summary:.6f} "
-            f"threshold={e.threshold:.6f} t*={e.frame_t_star} reason={e.reason}"
+            f"threshold={e.threshold:.6f} t*={e.frame_t_star + frame_offset} reason={e.reason}"
         )
 
 
@@ -862,8 +923,6 @@ def main() -> None:
     device = model.fg.params["means"].device
     scene_scale = float(model.fg.scene_scale.item())
 
-    num_frames = model.num_frames
-
     within_spacing, spacing_sample_count = estimate_within_cluster_spacing(
         clusters, sample_limit=args.spacing_sample_limit
     )
@@ -879,17 +938,22 @@ def main() -> None:
             if args.raw_track_max_match_distance is not None
             else contact_distance * 5.0
         )
-        positions_all_frames, confidences_all_frames, global_indices_by_cluster = (
+        # Raw tracks come from the dataset's own cached track files, not the
+        # model's motion bases -- num_frames is the full video length
+        # (dataset.num_frames), independent of how far this checkpoint has
+        # been frame-propagated. This can be less than model.num_frames
+        # (a not-yet-propagated checkpoint) without any problem.
+        positions_all_frames, confidences_all_frames, global_indices_by_cluster, num_frames = (
             load_raw_track_positions(
                 work_dir=work_dir,
                 clusters=clusters,
-                num_frames=num_frames,
                 num_query_frames=args.raw_track_num_query_frames,
                 num_samples_per_query=args.raw_track_samples_per_query,
                 max_match_distance=max_match_distance,
             )
         )
     else:
+        num_frames = model.num_frames
         with torch.no_grad():
             means_all, _ = model.compute_poses_fg(torch.arange(num_frames, device=device))
         positions_all_frames = means_all.detach().float().cpu().numpy()  # (G, T, 3)
@@ -900,10 +964,24 @@ def main() -> None:
             for cid in valid_ids
         }
 
+    skip = args.gap_skip_first_n_frames
+    if skip > 0:
+        if skip >= num_frames:
+            raise ValueError(
+                f"--gap-skip-first-n-frames ({skip}) must be < num_frames ({num_frames})"
+            )
+        print(f"[gap] skipping frames 0..{skip - 1}; {num_frames - skip}/{num_frames} frames remain")
+        positions_all_frames = positions_all_frames[:, skip:, :]
+        if confidences_all_frames is not None:
+            confidences_all_frames = confidences_all_frames[:, skip:]
+        num_frames -= skip
+
     config = ClusterGraphConfig(
         candidate_radius_multiplier=args.candidate_radius_multiplier,
+        center_gate_max_median_distance=args.center_gate_max_median_distance,
         keep_multiplier=args.keep_multiplier,
         gap_smoothing_window=args.gap_smoothing_window,
+        gap_confidence_threshold=args.gap_confidence_threshold,
         boundary_fraction=args.boundary_fraction,
         boundary_min_gaussians=args.boundary_min_gaussians,
         boundary_max_gaussians=args.boundary_max_gaussians,
@@ -929,7 +1007,7 @@ def main() -> None:
     print()
     log_gap_histogram(result)
     print()
-    log_edge_reasons(result)
+    log_edge_reasons(result, frame_offset=skip)
     print()
     log_neighbor_lists(result)
     print()
@@ -938,8 +1016,8 @@ def main() -> None:
     ]
     log_gate_check(result, args.gate_cluster_id, args.gate_expect_neighbor, gate_expect_absent)
 
-    edges_kept_dicts = [_edge_to_dict(e) for e in result.kept_edges]
-    edges_cut_dicts = [_edge_to_dict(e) for e in result.cut_edges]
+    edges_kept_dicts = [_edge_to_dict(e, frame_offset=skip) for e in result.kept_edges]
+    edges_cut_dicts = [_edge_to_dict(e, frame_offset=skip) for e in result.cut_edges]
 
     payload = {
         "edge_index": torch.from_numpy(result.edge_index()).long(),
@@ -954,6 +1032,7 @@ def main() -> None:
                 else work_dir / "checkpoints" / "last.ckpt"
             ),
             "num_frames": int(num_frames),
+            "gap_skip_first_n_frames": skip,
             "position_source": args.position_source,
             "scene_scale": scene_scale,
             "contact_distance": result.contact_distance,
@@ -972,8 +1051,8 @@ def main() -> None:
     }
     torch.save(payload, edges_pt)
 
-    write_csv(output_dir / "edges_kept.csv", [_edge_to_csv_row(e) for e in result.kept_edges])
-    write_csv(output_dir / "edges_cut.csv", [_edge_to_csv_row(e) for e in result.cut_edges])
+    write_csv(output_dir / "edges_kept.csv", [_edge_to_csv_row(e, frame_offset=skip) for e in result.kept_edges])
+    write_csv(output_dir / "edges_cut.csv", [_edge_to_csv_row(e, frame_offset=skip) for e in result.cut_edges])
 
     with (output_dir / "report.json").open("w", encoding="utf-8") as handle:
         json.dump(

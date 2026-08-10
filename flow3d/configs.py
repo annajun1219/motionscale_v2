@@ -137,8 +137,16 @@ class OptimConfig:
     # historical behavior. "connectivity": body-connectivity graph (spatial
     # adjacency + motion consistency), see flow3d/rigidity_graph.py -- avoids
     # anchoring a cluster to a spatially-close-but-unrelated one (e.g. the
-    # other hand during a clasped-hands pose).
+    # other hand during a clasped-hands pose). "cluster_graph_file": load a
+    # fixed graph from an offline edges.pt built by
+    # flow3d/analysis/build_cluster_graph.py (run against the init checkpoint
+    # with --position-source raw_tracks, before this training run, so the
+    # graph isn't built from this run's own learned motion) -- see
+    # rigidity_graph_path. Requires --optim.no-enable-bases-control, since
+    # bases split/cull remaps cluster ids the offline graph doesn't know
+    # about.
     rigidity_graph_type: str = "euclidean"
+    rigidity_graph_path: str | None = None
     connectivity_spatial_k: int = 12
     connectivity_min_shared_edges: int = 2
     connectivity_cv_threshold: float = 0.05

@@ -65,6 +65,22 @@ class ClusterGraphConfig:
     # contact_distance apart. Default errs generous so real edges aren't
     # dropped before the (cheap) gap check gets a chance to prune them.
     candidate_radius_multiplier: float = 30.0
+    # Sanity gate, independent of the boundary-gap check below: a pair is cut
+    # outright if its cluster CENTERS are, over the *whole* sequence
+    # (median center-to-center distance across all frames), farther apart
+    # than this. Deliberately loose and median-based (not the single
+    # closest-approach frame) -- this exists only to catch pairs that are
+    # essentially never in the same vicinity (so a boundary-gap reading
+    # small is almost certainly the min-over-many-noisy-candidate-pairs
+    # artifact: a large boundary-point pool always contains SOME near pair
+    # by chance), while leaving alone any pair that spends most of the clip
+    # apart but has a real, if brief, closer approach -- that's exactly the
+    # touching-then-separating case this must NOT cut. Calibrate per
+    # checkpoint/scene scale: on one checkpoint a real (if brief) touch had
+    # median center distance 0.27, while a pair confirmed never to touch
+    # still sat at 0.44 -- this threshold should sit between two such
+    # reference pairs, not be trusted blindly.
+    center_gate_max_median_distance: float = 0.4
     # Kept iff the smoothed, confidence-weighted max all-frames gap <
     # contact_distance * keep_multiplier.
     keep_multiplier: float = 1.5
@@ -73,6 +89,13 @@ class ClusterGraphConfig:
     # 1 disables smoothing (still confidence-weighted: zero-confidence frames
     # are excluded from the max where any confident frame exists).
     gap_smoothing_window: int = 5
+    # Hard confidence gate on the per-frame gap sequence: any frame whose
+    # confidence_t is below this is dropped entirely before smoothing/max,
+    # not just down-weighted -- same 0.5 threshold and "don't trust it at
+    # all below this" philosophy as flow3d/data/utils.py's
+    # parse_cotracker3_track_info visibility*confidence>0.5 gate used at
+    # training time, applied here to the same per-point confidence values.
+    gap_confidence_threshold: float = 0.5
     # Boundary-point *candidate set* selection at the closest frame (reuses
     # cluster_pairs.py). Deliberately generous -- this is no longer "the
     # boundary pair", just the pool each frame's cKDTree nearest-neighbor
@@ -98,6 +121,7 @@ class ClusterPairEdge:
     reason: str
     frame_t_star: int
     center_distance_t_star: float
+    center_distance_median: float
     gap_summary: float
     gap_median: float
     gap_min: float
@@ -294,42 +318,52 @@ def smooth_and_summarize_gap(
     gap_t: np.ndarray,
     confidence_t: np.ndarray,
     window: int = 5,
+    confidence_threshold: float = 0.5,
 ) -> float:
     """
-    Confidence-weighted temporal smoothing of the per-frame gap sequence,
-    then take the max of the smoothed sequence as the summary statistic.
+    Hard-gate the per-frame gap sequence by confidence, then temporally
+    smooth the surviving frames and take the max of the smoothed sequence as
+    the summary statistic.
 
     A plain max over raw per-frame gaps is fragile: one occluded/jittery
     frame can spike the gap and cut an edge that's actually attached the
-    whole sequence. Smoothing first (weighted by confidence, so untrustworthy
-    frames are downweighted rather than allowed to dominate their window)
-    tempers isolated spikes while still letting a *sustained* separation --
-    several consecutive frames genuinely apart -- carry through to the max,
-    unlike a percentile which would just discount it as an outlier.
+    whole sequence. A frame below confidence_threshold is dropped entirely
+    (not down-weighted) before smoothing -- the same "don't trust it at all"
+    threshold flow3d/data/utils.py's parse_cotracker3_track_info already
+    applies at training time (visibility*confidence>0.5), so a frame this
+    graph wouldn't trust for training doesn't get to veto an edge either.
+    Smoothing the surviving frames still tempers isolated noise while
+    letting a *sustained* separation carry through to the max, unlike a
+    percentile which would just discount it as an outlier.
 
-    :param window: frames per smoothing window (odd covers symmetrically).
-        <= 1 skips windowed smoothing but still applies confidence gating:
-        zero-confidence frames are excluded from the max whenever at least
-        one confident frame exists.
+    :param window: frames per smoothing window (odd covers symmetrically),
+        applied only across trustworthy frames within each temporal window.
+        <= 1 skips windowed smoothing (still confidence-gated).
     """
     T = len(gap_t)
     if T == 0:
         return 0.0
 
+    trustworthy = confidence_t >= confidence_threshold
+    if not trustworthy.any():
+        # No frame clears the gate at all -- fall back to the raw max rather
+        # than silently reporting "always touching" from an empty sequence.
+        return float(gap_t.max())
+
     if window <= 1 or T <= 1:
-        trustworthy = confidence_t > 0
-        return float(gap_t[trustworthy].max()) if trustworthy.any() else float(gap_t.max())
+        return float(gap_t[trustworthy].max())
 
     half = window // 2
-    smoothed = np.empty(T, dtype=np.float64)
+    smoothed: list[float] = []
     for t in range(T):
+        if not trustworthy[t]:
+            continue
         lo, hi = max(0, t - half), min(T, t + half + 1)
-        w = confidence_t[lo:hi]
         g = gap_t[lo:hi]
-        wsum = float(w.sum())
-        smoothed[t] = float((g * w).sum() / wsum) if wsum > 0 else float(g.mean())
+        m = trustworthy[lo:hi]
+        smoothed.append(float(g[m].mean()))
 
-    return float(smoothed.max())
+    return float(max(smoothed))
 
 
 def build_cluster_graph(
@@ -369,6 +403,7 @@ def build_cluster_graph(
     centers_ts = compute_cluster_center_trajectories(
         cluster_ids, global_indices_by_cluster, positions_all_frames
     )
+    cluster_row = {cid: i for i, cid in enumerate(cluster_ids)}
     candidate_pairs, candidate_info = find_candidate_pairs(cluster_ids, centers_ts, radius)
 
     edges: list[ClusterPairEdge] = []
@@ -376,6 +411,11 @@ def build_cluster_graph(
         t_star, center_distance = candidate_info[(a, b)]
         global_a = global_indices_by_cluster[a]
         global_b = global_indices_by_cluster[b]
+
+        center_distance_all_frames = np.linalg.norm(
+            centers_ts[cluster_row[a]] - centers_ts[cluster_row[b]], axis=-1
+        )
+        center_distance_median = float(np.median(center_distance_all_frames))
 
         boundary_a, boundary_b = select_boundary_at_frame(
             global_a,
@@ -391,17 +431,47 @@ def build_cluster_graph(
         gap_t, confidence_t = compute_all_frames_gap(
             boundary_a, boundary_b, positions_all_frames, confidences_all_frames,
         )
-        gap_summary = smooth_and_summarize_gap(gap_t, confidence_t, config.gap_smoothing_window)
-        kept = gap_summary < threshold
+        gap_summary = smooth_and_summarize_gap(
+            gap_t, confidence_t, config.gap_smoothing_window, config.gap_confidence_threshold,
+        )
+
+        # Safety net: a real (even always-touching) pair still has 143 frames
+        # of independent floating-point jitter, so gap_t reading EXACTLY 0.0
+        # in every single frame is not physically plausible -- it's the
+        # signature of two different clusters' boundary Gaussians having
+        # been matched to the identical position source (e.g. a raw-track
+        # pooling collision), not measured contact. Cut unconditionally,
+        # regardless of gap_summary/threshold.
+        suspected_collision = bool(np.all(gap_t == 0.0))
+
+        # Sanity gate: over the whole sequence, the cluster CENTERS must
+        # typically (median) stay within center_gate_max_median_distance of
+        # each other. A boundary-gap reading small despite the centers
+        # essentially never sharing a vicinity is the min-over-many-noisy-
+        # candidate-pairs artifact this gate exists to catch (see
+        # ClusterGraphConfig.center_gate_max_median_distance) -- checked
+        # first since it's the cheaper, more fundamental implausibility.
+        # Median (not closest-approach) deliberately leaves a pair that's
+        # apart most of the clip but has one real brief touch untouched.
+        if center_distance_median > config.center_gate_max_median_distance:
+            kept = False
+            reason = "cut_center_too_far"
+        elif suspected_collision:
+            kept = False
+            reason = "cut_suspected_position_collision"
+        else:
+            kept = gap_summary < threshold
+            reason = "kept_all_frames_contact" if kept else "cut_gap_exceeds_threshold"
 
         edges.append(
             ClusterPairEdge(
                 cluster_a=a,
                 cluster_b=b,
                 kept=kept,
-                reason="kept_all_frames_contact" if kept else "cut_gap_exceeds_threshold",
+                reason=reason,
                 frame_t_star=t_star,
                 center_distance_t_star=center_distance,
+                center_distance_median=center_distance_median,
                 gap_summary=gap_summary,
                 gap_median=float(np.median(gap_t)),
                 gap_min=float(gap_t.min()),
