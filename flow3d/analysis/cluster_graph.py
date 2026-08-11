@@ -88,6 +88,13 @@ class ClusterGraphConfig:
     # and is cut outright here, before the (more expensive) boundary-gap
     # check ever runs on it.
     center_gate_max_median_to_p10_ratio: float = 5.0
+    # Absolute-distance sanity gate, independent of the ratio gate above: a
+    # pair is cut outright if its cluster CENTERS' median distance across the
+    # whole sequence exceeds this many world units, regardless of how that
+    # median compares to the pair's own p10 (a pair can have a "tight" ratio
+    # while still sitting nowhere near contact in absolute terms, e.g. two
+    # centers that are always ~2 units apart but only ever vary a little).
+    center_gate_max_median_absolute_distance: float = 0.4
     # Kept iff the smoothed, confidence-weighted max all-frames gap <
     # contact_distance * keep_multiplier.
     keep_multiplier: float = 1.5
@@ -460,20 +467,28 @@ def build_cluster_graph(
         # regardless of gap_summary/threshold.
         suspected_collision = bool(np.all(gap_t == 0.0))
 
-        # Sanity gate: over the whole sequence, the cluster CENTERS' median
-        # distance must not be more than center_gate_max_median_to_p10_ratio
-        # times their 10th-percentile distance. A large ratio means this
-        # pair's closest-approach regime is rare relative to how far apart
-        # they usually are -- indistinguishable here from the min-over-many-
-        # noisy-candidate-pairs artifact this gate exists to catch (see
-        # ClusterGraphConfig.center_gate_max_median_to_p10_ratio) -- checked
-        # first since it's the cheaper, more fundamental implausibility.
-        # p10 <= 0 (degenerate exact-coincidence for >=10% of frames) is
-        # treated as an infinite ratio, i.e. always cut here.
+        # Sanity gates, checked in order of cheapest/most fundamental
+        # implausibility first:
+        # 1) Absolute gate: the cluster CENTERS' median distance across the
+        #    whole sequence must not exceed center_gate_max_median_absolute_distance
+        #    world units, regardless of the ratio gate below -- catches pairs
+        #    that are simply never close in absolute terms.
+        # 2) Ratio gate: that same median must not be more than
+        #    center_gate_max_median_to_p10_ratio times their 10th-percentile
+        #    distance. A large ratio means this pair's closest-approach
+        #    regime is rare relative to how far apart they usually are --
+        #    indistinguishable here from the min-over-many-noisy-candidate-
+        #    pairs artifact this gate exists to catch (see
+        #    ClusterGraphConfig.center_gate_max_median_to_p10_ratio). p10 <= 0
+        #    (degenerate exact-coincidence for >=10% of frames) is treated as
+        #    an infinite ratio, i.e. always cut here.
         center_distance_median_to_p10_ratio = (
             center_distance_median / center_distance_p10 if center_distance_p10 > 0 else float("inf")
         )
-        if center_distance_median_to_p10_ratio > config.center_gate_max_median_to_p10_ratio:
+        if center_distance_median > config.center_gate_max_median_absolute_distance:
+            kept = False
+            reason = "cut_center_median_absolute_distance_too_high"
+        elif center_distance_median_to_p10_ratio > config.center_gate_max_median_to_p10_ratio:
             kept = False
             reason = "cut_center_median_p10_ratio_too_high"
         elif suspected_collision:

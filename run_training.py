@@ -107,7 +107,7 @@ def main():
 
     ## Model Preparation
     ckpt_path = os.path.join(cfg.work_dir, "checkpoints/last.ckpt") if cfg.ckpt_path is None else cfg.ckpt_path
-    initialize_and_checkpoint_model(
+    load_ckpt_path = initialize_and_checkpoint_model(
         cfg,
         train_dataset,
         device,
@@ -118,7 +118,7 @@ def main():
     )
 
     trainer, start_epoch = Trainer.init_from_checkpoint(
-        ckpt_path,
+        load_ckpt_path,
         device,
         cfg.lr,
         cfg.loss,
@@ -282,10 +282,23 @@ def initialize_and_checkpoint_model(
     use_2dgs: bool,
     vis: bool = False,
     port: int | None = None,
-):
+) -> str:
+    """
+    :return: path main() should actually load via Trainer.init_from_checkpoint.
+        Normally just ckpt_path unchanged. The one exception is resuming with
+        --enable_graph_coupling from a checkpoint that doesn't have the GNN
+        yet (see _wrap_checkpoint_with_graph_coupling below) -- that writes a
+        wrapped copy under cfg.work_dir's own checkpoints/ instead of back to
+        ckpt_path, so an externally-supplied --ckpt_path source is never
+        overwritten, and returns that copy's path.
+    """
     if os.path.exists(ckpt_path):
+        if cfg.enable_graph_coupling:
+            wrapped_path = _wrap_checkpoint_with_graph_coupling(cfg, ckpt_path)
+            if wrapped_path is not None:
+                return wrapped_path
         guru.info(f"model checkpoint exists at {ckpt_path}")
-        return
+        return ckpt_path
 
     fg_params, motion_bases, bg_params, tracks_3d, shad_params, shad_bases = init_model_from_tracks(
         train_dataset,
@@ -358,6 +371,94 @@ def initialize_and_checkpoint_model(
     guru.info(f"Saving initialization to {ckpt_path}")
     os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
     torch.save({"model": model.state_dict(), "epoch": 0, "global_step": 0}, ckpt_path)
+    return ckpt_path
+
+
+def _wrap_checkpoint_with_graph_coupling(cfg: TrainConfig, source_ckpt_path: str) -> str | None:
+    """
+    Resume support for --enable_graph_coupling starting from a checkpoint
+    trained WITHOUT it (plain ScalableMotionBases motion_bases -- e.g. a
+    warmup run's last.ckpt): wraps motion_bases in
+    GraphCorrectedScalableMotionBases in place and writes the result to
+    cfg.work_dir's own checkpoints/last.ckpt, leaving source_ckpt_path itself
+    untouched (it may be an external run's checkpoint that other work still
+    depends on).
+
+    The wrap is exactly GraphCorrectedScalableMotionBases.from_scalable_motion_bases:
+    coarse/fine motion params are copied as-is and only the GNN correction is
+    added, zero-initialized (ClusterGraphGNN.__init__ zeros the head layer),
+    so it's a no-op the instant training resumes -- identical outputs to the
+    source checkpoint until gradients move the GNN off zero.
+
+    Optimizer/scheduler state from source_ckpt_path is intentionally dropped:
+    it has no entries for the new motion_bases.gnn.* params, and
+    Trainer.load_checkpoint_optimizers indexes every one of the resumed
+    model's param groups into that dict, so keeping it would KeyError on
+    those params. Dropping it means ALL params (not just the GNN's) get a
+    fresh Adam optimizer on resume -- epoch/global_step are preserved from
+    source_ckpt_path so the epoch-based propagation schedule and checkpoint
+    cadence still continue from where it left off.
+
+    :return: path to the wrapped checkpoint, or None if source_ckpt_path is
+        already graph-coupled (has "motion_bases.gnn." keys) -- nothing to do,
+        SceneModel.init_from_state_dict already restores it correctly as-is.
+    """
+    assert cfg.graph_coupling_path, (
+        "enable_graph_coupling=True requires --graph_coupling_path to point "
+        "to an edges.pt built by flow3d/analysis/build_cluster_graph.py."
+    )
+    assert not cfg.optim.enable_bases_control, (
+        "enable_graph_coupling requires --optim.no-enable-bases-control: "
+        "bases split/cull would remap cluster ids that the graph topology "
+        "doesn't know about."
+    )
+
+    ckpt = torch.load(source_ckpt_path, map_location="cpu", weights_only=False)
+    state_dict = ckpt["model"]
+    if any("motion_bases.gnn." in k for k in state_dict):
+        return None
+
+    from flow3d.graph_coupling import (
+        GraphCorrectedScalableMotionBases,
+        build_edge_index_from_edges_pt,
+    )
+    from flow3d.params import ScalableMotionBases
+
+    plain_motion_bases = ScalableMotionBases.init_from_state_dict(
+        state_dict, prefix="motion_bases.params."
+    )
+    edge_index = build_edge_index_from_edges_pt(
+        cfg.graph_coupling_path, num_clusters=plain_motion_bases.num_clusters
+    )
+    model = SceneModel.init_from_state_dict(state_dict)
+    model.motion_bases = GraphCorrectedScalableMotionBases.from_scalable_motion_bases(
+        plain_motion_bases,
+        edge_index=edge_index,
+        gnn_hidden_dim=cfg.gnn_hidden,
+        gnn_num_layers=cfg.gnn_layers,
+    )
+
+    target_ckpt_path = os.path.join(cfg.work_dir, "checkpoints/last.ckpt")
+    guru.info(
+        f"Resume: {source_ckpt_path} has plain motion_bases -- wrapping with "
+        f"GraphCorrectedScalableMotionBases (hidden={cfg.gnn_hidden}, "
+        f"layers={cfg.gnn_layers}, edges={edge_index.shape[1]}, from "
+        f"{cfg.graph_coupling_path}; correction zero-initialized) and saving "
+        f"to {target_ckpt_path} (source left untouched, epoch="
+        f"{ckpt.get('epoch', 0)}, global_step={ckpt.get('global_step', 0)} "
+        f"preserved, optimizer/scheduler state dropped -- fresh optimizer "
+        f"for all params)."
+    )
+    os.makedirs(os.path.dirname(target_ckpt_path), exist_ok=True)
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "epoch": ckpt.get("epoch", 0),
+            "global_step": ckpt.get("global_step", 0),
+        },
+        target_ckpt_path,
+    )
+    return target_ckpt_path
 
 
 def init_model_from_tracks(
