@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 import tyro
 import yaml
 
@@ -199,8 +199,9 @@ class TrainConfig:
     affinity_method: str = "agglomerative"
     affinity_n_clusters: int = 40  # only used when affinity_method == "agglomerative"
 
-    ### Graph-coupled cluster GNN (see flow3d/graph_coupling.py)
-    # Wraps motion_bases in GraphCorrectedScalableMotionBases: a GNN mixes each
+    ### Graph-coupled cluster GNN (see flow3d/graph_coupling.py /
+    ### flow3d/graph_coupling_relative.py)
+    # Wraps motion_bases in a *GraphCorrectedScalableMotionBases: a GNN mixes each
     # cluster's coarse (global) rotation/translation with its graph neighbors'
     # and predicts a zero-init residual correction, composed onto the coarse
     # transform (rotation via so(3) compose, translation via add). Intended to
@@ -215,6 +216,15 @@ class TrainConfig:
     graph_coupling_path: str | None = None
     gnn_hidden: int = 128
     gnn_layers: int = 2
+    # "absolute" (flow3d/graph_coupling.py, ClusterGraphGNN): message passing
+    # mean-aggregates neighbors' raw hidden features.
+    # "relative" (flow3d/graph_coupling_relative.py, RelativeClusterGraphGNN):
+    # message passing uses explicit relative motion/geometry edge features
+    # (t_j - t_i, c_j - c_i, rot6d(R_i^T @ R_j)) plus hidden-state differences.
+    # Only affects how graph-coupling messages are built; everything else
+    # (topology, hidden_dim, num_layers, output dim, loss, optimizer) is
+    # identical, so the two are a fair ablation of each other.
+    gnn_variant: Literal["absolute", "relative"] = "absolute"
 
     # Training
     num_glob_epochs: int = 400

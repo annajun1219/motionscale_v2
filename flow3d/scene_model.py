@@ -234,16 +234,35 @@ class SceneModel(nn.Module):
             bg = GaussianParams.init_from_state_dict(
                 state_dict, prefix=f"{prefix}bg."
             )
-        if any(f"{prefix}motion_bases.gnn." in k for k in state_dict):
-            # flow3d/graph_coupling.py: coarse transform is corrected by a
-            # mean-aggregation message-passing GNN on top of a ScalableMotionBases.
-            # Same reasoning as above -- the correction lives in the "gnn"
-            # submodule, not in params, so it must be reconstructed explicitly.
-            from flow3d.graph_coupling import GraphCorrectedScalableMotionBases
-
-            motion_bases = GraphCorrectedScalableMotionBases.init_from_state_dict(
-                state_dict, prefix=f"{prefix}motion_bases."
+        gnn_prefix = f"{prefix}motion_bases.gnn."
+        if any(k.startswith(gnn_prefix) for k in state_dict):
+            # flow3d/graph_coupling.py / flow3d/graph_coupling_relative.py:
+            # coarse transform is corrected by a message-passing GNN on top of
+            # a ScalableMotionBases. Same reasoning as above -- the correction
+            # lives in the "gnn" submodule, not in params, so it must be
+            # reconstructed explicitly. The two variants share the "gnn."
+            # prefix, so tell them apart by their message-layer submodule
+            # names: RelativeClusterGraphGNN's _RelativeMessageLayer stores its
+            # MLP under "layers.<i>.mlp.", while baseline ClusterGraphGNN's
+            # _MeanAggLayer stores a single Linear under "layers.<i>.lin.".
+            is_relative = any(
+                k.startswith(f"{gnn_prefix}layers.") and ".mlp." in k
+                for k in state_dict
             )
+            if is_relative:
+                from flow3d.graph_coupling_relative import (
+                    RelativeGraphCorrectedScalableMotionBases,
+                )
+
+                motion_bases = RelativeGraphCorrectedScalableMotionBases.init_from_state_dict(
+                    state_dict, prefix=f"{prefix}motion_bases."
+                )
+            else:
+                from flow3d.graph_coupling import GraphCorrectedScalableMotionBases
+
+                motion_bases = GraphCorrectedScalableMotionBases.init_from_state_dict(
+                    state_dict, prefix=f"{prefix}motion_bases."
+                )
         elif f"{prefix}motion_bases.params.fine_rots" in state_dict:
             motion_bases = ScalableMotionBases.init_from_state_dict(state_dict, prefix=f"{prefix}motion_bases.params.")
         else:

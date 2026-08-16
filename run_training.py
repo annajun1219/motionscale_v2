@@ -59,6 +59,28 @@ def set_seed(seed):
 set_seed(42)
 
 
+def _graph_corrected_bases_cls(gnn_variant: str):
+    """Resolve which *GraphCorrectedScalableMotionBases class implements
+    cfg.gnn_variant ("absolute" -> flow3d/graph_coupling.py's
+    GraphCorrectedScalableMotionBases, "relative" -> flow3d/graph_coupling_relative.py's
+    RelativeGraphCorrectedScalableMotionBases). Both share the exact same
+    constructor/from_scalable_motion_bases signature, so callers can swap the
+    class without touching the rest of the wrapping code.
+    """
+    if gnn_variant == "relative":
+        from flow3d.graph_coupling_relative import (
+            RelativeGraphCorrectedScalableMotionBases,
+        )
+
+        return RelativeGraphCorrectedScalableMotionBases
+    elif gnn_variant == "absolute":
+        from flow3d.graph_coupling import GraphCorrectedScalableMotionBases
+
+        return GraphCorrectedScalableMotionBases
+    else:
+        raise ValueError(f"Unknown gnn_variant: {gnn_variant!r}")
+
+
 def get_git_info() -> str:
     """
     Get the current Git commit hash of the codebase.
@@ -344,23 +366,22 @@ def initialize_and_checkpoint_model(
             "enable_graph_coupling=True requires --graph_coupling_path to point "
             "to an edges.pt built by flow3d/analysis/build_cluster_graph.py."
         )
-        from flow3d.graph_coupling import (
-            GraphCorrectedScalableMotionBases,
-            build_edge_index_from_edges_pt,
-        )
+        from flow3d.graph_coupling import build_edge_index_from_edges_pt
 
+        GraphBasesCls = _graph_corrected_bases_cls(cfg.gnn_variant)
         edge_index = build_edge_index_from_edges_pt(
             cfg.graph_coupling_path, num_clusters=motion_bases.num_clusters
         )
-        motion_bases = GraphCorrectedScalableMotionBases.from_scalable_motion_bases(
+        motion_bases = GraphBasesCls.from_scalable_motion_bases(
             motion_bases,
             edge_index=edge_index,
             gnn_hidden_dim=cfg.gnn_hidden,
             gnn_num_layers=cfg.gnn_layers,
         ).to(device)
         guru.info(
-            f"Graph coupling enabled: wrapped motion_bases with GNN "
-            f"(hidden={cfg.gnn_hidden}, layers={cfg.gnn_layers}, "
+            f"Graph coupling enabled: wrapped motion_bases with "
+            f"{GraphBasesCls.__name__} (variant={cfg.gnn_variant}, "
+            f"hidden={cfg.gnn_hidden}, layers={cfg.gnn_layers}, "
             f"edges={edge_index.shape[1]}, from {cfg.graph_coupling_path})"
         )
 
@@ -378,17 +399,19 @@ def _wrap_checkpoint_with_graph_coupling(cfg: TrainConfig, source_ckpt_path: str
     """
     Resume support for --enable_graph_coupling starting from a checkpoint
     trained WITHOUT it (plain ScalableMotionBases motion_bases -- e.g. a
-    warmup run's last.ckpt): wraps motion_bases in
-    GraphCorrectedScalableMotionBases in place and writes the result to
+    warmup run's last.ckpt): wraps motion_bases in the
+    *GraphCorrectedScalableMotionBases class selected by cfg.gnn_variant
+    (see _graph_corrected_bases_cls) in place and writes the result to
     cfg.work_dir's own checkpoints/last.ckpt, leaving source_ckpt_path itself
     untouched (it may be an external run's checkpoint that other work still
     depends on).
 
-    The wrap is exactly GraphCorrectedScalableMotionBases.from_scalable_motion_bases:
-    coarse/fine motion params are copied as-is and only the GNN correction is
-    added, zero-initialized (ClusterGraphGNN.__init__ zeros the head layer),
-    so it's a no-op the instant training resumes -- identical outputs to the
-    source checkpoint until gradients move the GNN off zero.
+    The wrap is exactly GraphBasesCls.from_scalable_motion_bases: coarse/fine
+    motion params are copied as-is and only the GNN correction is added,
+    zero-initialized (both ClusterGraphGNN and RelativeClusterGraphGNN zero
+    the head layer in __init__), so it's a no-op the instant training resumes
+    -- identical outputs to the source checkpoint until gradients move the
+    GNN off zero.
 
     Optimizer/scheduler state from source_ckpt_path is intentionally dropped:
     it has no entries for the new motion_bases.gnn.* params, and
@@ -418,12 +441,10 @@ def _wrap_checkpoint_with_graph_coupling(cfg: TrainConfig, source_ckpt_path: str
     if any("motion_bases.gnn." in k for k in state_dict):
         return None
 
-    from flow3d.graph_coupling import (
-        GraphCorrectedScalableMotionBases,
-        build_edge_index_from_edges_pt,
-    )
+    from flow3d.graph_coupling import build_edge_index_from_edges_pt
     from flow3d.params import ScalableMotionBases
 
+    GraphBasesCls = _graph_corrected_bases_cls(cfg.gnn_variant)
     plain_motion_bases = ScalableMotionBases.init_from_state_dict(
         state_dict, prefix="motion_bases.params."
     )
@@ -431,7 +452,7 @@ def _wrap_checkpoint_with_graph_coupling(cfg: TrainConfig, source_ckpt_path: str
         cfg.graph_coupling_path, num_clusters=plain_motion_bases.num_clusters
     )
     model = SceneModel.init_from_state_dict(state_dict)
-    model.motion_bases = GraphCorrectedScalableMotionBases.from_scalable_motion_bases(
+    model.motion_bases = GraphBasesCls.from_scalable_motion_bases(
         plain_motion_bases,
         edge_index=edge_index,
         gnn_hidden_dim=cfg.gnn_hidden,
@@ -441,8 +462,9 @@ def _wrap_checkpoint_with_graph_coupling(cfg: TrainConfig, source_ckpt_path: str
     target_ckpt_path = os.path.join(cfg.work_dir, "checkpoints/last.ckpt")
     guru.info(
         f"Resume: {source_ckpt_path} has plain motion_bases -- wrapping with "
-        f"GraphCorrectedScalableMotionBases (hidden={cfg.gnn_hidden}, "
-        f"layers={cfg.gnn_layers}, edges={edge_index.shape[1]}, from "
+        f"{GraphBasesCls.__name__} (variant={cfg.gnn_variant}, "
+        f"hidden={cfg.gnn_hidden}, layers={cfg.gnn_layers}, "
+        f"edges={edge_index.shape[1]}, from "
         f"{cfg.graph_coupling_path}; correction zero-initialized) and saving "
         f"to {target_ckpt_path} (source left untouched, epoch="
         f"{ckpt.get('epoch', 0)}, global_step={ckpt.get('global_step', 0)} "
