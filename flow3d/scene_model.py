@@ -236,20 +236,61 @@ class SceneModel(nn.Module):
             )
         gnn_prefix = f"{prefix}motion_bases.gnn."
         if any(k.startswith(gnn_prefix) for k in state_dict):
-            # flow3d/graph_coupling.py / flow3d/graph_coupling_relative.py:
-            # coarse transform is corrected by a message-passing GNN on top of
-            # a ScalableMotionBases. Same reasoning as above -- the correction
+            # flow3d/graph_coupling.py / flow3d/graph_coupling_relative.py /
+            # flow3d/graph_relative_velocity_linear.py /
+            # flow3d/graph_relative_velocity_angular.py /
+            # flow3d/graph_relative_linear_attention.py: coarse transform is
+            # corrected by a message-passing GNN on top of a
+            # ScalableMotionBases. Same reasoning as above -- the correction
             # lives in the "gnn" submodule, not in params, so it must be
-            # reconstructed explicitly. The two variants share the "gnn."
+            # reconstructed explicitly. The five variants share the "gnn."
             # prefix, so tell them apart by their message-layer submodule
-            # names: RelativeClusterGraphGNN's _RelativeMessageLayer stores its
-            # MLP under "layers.<i>.mlp.", while baseline ClusterGraphGNN's
-            # _MeanAggLayer stores a single Linear under "layers.<i>.lin.".
+            # names and buffers: RelativeClusterGraphGNN-family stores its MLP
+            # under "layers.<i>.mlp." (baseline ClusterGraphGNN's _MeanAggLayer
+            # uses "layers.<i>.lin." instead), RelativeVelocityLinearClusterGraphGNN
+            # additionally has a "vel_scale" buffer that plain
+            # RelativeClusterGraphGNN doesn't, RelativeVelocityAngularClusterGraphGNN
+            # additionally has an "ang_vel_scale" buffer on top of that, and
+            # RelativeVelLinearAttentionClusterGraphGNN has a "vel_scale" buffer
+            # (like velocity_linear) but replaces the mean-aggregation layer
+            # with an attention layer that has a "layers.<i>.W_score." submodule
+            # -- check the most specific signature first (angular, then
+            # attention, then linear, then plain relative).
+            is_velocity_angular = f"{gnn_prefix}ang_vel_scale" in state_dict
+            is_velocity_linear_attention = any(
+                k.startswith(f"{gnn_prefix}layers.") and ".W_score." in k
+                for k in state_dict
+            )
+            is_velocity_linear = f"{gnn_prefix}vel_scale" in state_dict
             is_relative = any(
                 k.startswith(f"{gnn_prefix}layers.") and ".mlp." in k
                 for k in state_dict
             )
-            if is_relative:
+            if is_velocity_angular:
+                from flow3d.graph_relative_velocity_angular import (
+                    RelativeVelocityAngularGraphCorrectedScalableMotionBases,
+                )
+
+                motion_bases = RelativeVelocityAngularGraphCorrectedScalableMotionBases.init_from_state_dict(
+                    state_dict, prefix=f"{prefix}motion_bases."
+                )
+            elif is_velocity_linear_attention:
+                from flow3d.graph_relative_linear_attention import (
+                    RelativeVelLinearAttentionGraphCorrectedScalableMotionBases,
+                )
+
+                motion_bases = RelativeVelLinearAttentionGraphCorrectedScalableMotionBases.init_from_state_dict(
+                    state_dict, prefix=f"{prefix}motion_bases."
+                )
+            elif is_velocity_linear:
+                from flow3d.graph_relative_velocity_linear import (
+                    RelativeVelocityLinearGraphCorrectedScalableMotionBases,
+                )
+
+                motion_bases = RelativeVelocityLinearGraphCorrectedScalableMotionBases.init_from_state_dict(
+                    state_dict, prefix=f"{prefix}motion_bases."
+                )
+            elif is_relative:
                 from flow3d.graph_coupling_relative import (
                     RelativeGraphCorrectedScalableMotionBases,
                 )

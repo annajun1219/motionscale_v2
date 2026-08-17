@@ -216,15 +216,46 @@ class TrainConfig:
     graph_coupling_path: str | None = None
     gnn_hidden: int = 128
     gnn_layers: int = 2
+    # only used by gnn_variant == "relative_velocity_linear_attention" (number
+    # of attention heads; hidden_dim must be divisible by this).
+    gnn_heads: int = 4
     # "absolute" (flow3d/graph_coupling.py, ClusterGraphGNN): message passing
     # mean-aggregates neighbors' raw hidden features.
     # "relative" (flow3d/graph_coupling_relative.py, RelativeClusterGraphGNN):
     # message passing uses explicit relative motion/geometry edge features
     # (t_j - t_i, c_j - c_i, rot6d(R_i^T @ R_j)) plus hidden-state differences.
+    # "relative_velocity_linear" (flow3d/graph_relative_velocity_linear.py,
+    # RelativeVelocityLinearClusterGraphGNN): same as "relative", plus each
+    # cluster's linear velocity (frame-to-frame coarse translation delta) is
+    # added to both the node feature (absolute v_i) and the edge feature
+    # (relative v_j - v_i), normalized by a std-based vel_scale computed once
+    # at construction time. Angular velocity/temporal-smoothness loss are not
+    # part of this variant.
+    # "relative_velocity_angular" (flow3d/graph_relative_velocity_angular.py,
+    # RelativeVelocityAngularClusterGraphGNN): same as
+    # "relative_velocity_linear" (keeps linear velocity), plus each cluster's
+    # angular velocity (frame-to-frame coarse rotation delta, as an SO(3) log
+    # via roma.rotmat_to_rotvec) is added to both the node feature (absolute
+    # ang_vel_i) and the edge feature (ang_vel_j - ang_vel_i), normalized by a
+    # separate std-based ang_vel_scale computed once at construction time.
+    # Temporal smoothness loss is not part of this variant.
+    # "relative_velocity_linear_attention" (flow3d/graph_relative_linear_attention.py,
+    # RelativeVelLinearAttentionClusterGraphGNN): same node/edge features as
+    # "relative_velocity_linear" (linear velocity only, no angular), but
+    # neighbor message aggregation is replaced with learned multi-head
+    # GAT-style attention (softmax over each receiver's in-neighbors, edge
+    # feature included in the attention score) instead of a uniform
+    # (1/in_degree) mean. gnn_heads controls the number of attention heads.
     # Only affects how graph-coupling messages are built; everything else
     # (topology, hidden_dim, num_layers, output dim, loss, optimizer) is
-    # identical, so the two are a fair ablation of each other.
-    gnn_variant: Literal["absolute", "relative"] = "absolute"
+    # identical, so all five are a fair ablation of each other.
+    gnn_variant: Literal[
+        "absolute",
+        "relative",
+        "relative_velocity_linear",
+        "relative_velocity_angular",
+        "relative_velocity_linear_attention",
+    ] = "absolute"
 
     # Training
     num_glob_epochs: int = 400

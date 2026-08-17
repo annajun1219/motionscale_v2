@@ -63,9 +63,18 @@ def _graph_corrected_bases_cls(gnn_variant: str):
     """Resolve which *GraphCorrectedScalableMotionBases class implements
     cfg.gnn_variant ("absolute" -> flow3d/graph_coupling.py's
     GraphCorrectedScalableMotionBases, "relative" -> flow3d/graph_coupling_relative.py's
-    RelativeGraphCorrectedScalableMotionBases). Both share the exact same
-    constructor/from_scalable_motion_bases signature, so callers can swap the
-    class without touching the rest of the wrapping code.
+    RelativeGraphCorrectedScalableMotionBases, "relative_velocity_linear" ->
+    flow3d/graph_relative_velocity_linear.py's
+    RelativeVelocityLinearGraphCorrectedScalableMotionBases,
+    "relative_velocity_angular" -> flow3d/graph_relative_velocity_angular.py's
+    RelativeVelocityAngularGraphCorrectedScalableMotionBases,
+    "relative_velocity_linear_attention" ->
+    flow3d/graph_relative_linear_attention.py's
+    RelativeVelLinearAttentionGraphCorrectedScalableMotionBases). All five
+    share the exact same constructor/from_scalable_motion_bases signature
+    (modulo the attention variant's extra gnn_num_heads kwarg, see
+    _graph_bases_extra_kwargs), so callers can swap the class without
+    touching the rest of the wrapping code.
     """
     if gnn_variant == "relative":
         from flow3d.graph_coupling_relative import (
@@ -73,12 +82,40 @@ def _graph_corrected_bases_cls(gnn_variant: str):
         )
 
         return RelativeGraphCorrectedScalableMotionBases
+    elif gnn_variant == "relative_velocity_linear":
+        from flow3d.graph_relative_velocity_linear import (
+            RelativeVelocityLinearGraphCorrectedScalableMotionBases,
+        )
+
+        return RelativeVelocityLinearGraphCorrectedScalableMotionBases
+    elif gnn_variant == "relative_velocity_angular":
+        from flow3d.graph_relative_velocity_angular import (
+            RelativeVelocityAngularGraphCorrectedScalableMotionBases,
+        )
+
+        return RelativeVelocityAngularGraphCorrectedScalableMotionBases
+    elif gnn_variant == "relative_velocity_linear_attention":
+        from flow3d.graph_relative_linear_attention import (
+            RelativeVelLinearAttentionGraphCorrectedScalableMotionBases,
+        )
+
+        return RelativeVelLinearAttentionGraphCorrectedScalableMotionBases
     elif gnn_variant == "absolute":
         from flow3d.graph_coupling import GraphCorrectedScalableMotionBases
 
         return GraphCorrectedScalableMotionBases
     else:
         raise ValueError(f"Unknown gnn_variant: {gnn_variant!r}")
+
+
+def _graph_bases_extra_kwargs(cfg: TrainConfig) -> dict:
+    """Extra from_scalable_motion_bases kwargs specific to some gnn_variant
+    values (currently just gnn_num_heads for the attention variant -- every
+    other variant's from_scalable_motion_bases takes no extra args beyond
+    edge_index/gnn_hidden_dim/gnn_num_layers)."""
+    if cfg.gnn_variant == "relative_velocity_linear_attention":
+        return {"gnn_num_heads": cfg.gnn_heads}
+    return {}
 
 
 def get_git_info() -> str:
@@ -377,6 +414,7 @@ def initialize_and_checkpoint_model(
             edge_index=edge_index,
             gnn_hidden_dim=cfg.gnn_hidden,
             gnn_num_layers=cfg.gnn_layers,
+            **_graph_bases_extra_kwargs(cfg),
         ).to(device)
         guru.info(
             f"Graph coupling enabled: wrapped motion_bases with "
@@ -457,6 +495,7 @@ def _wrap_checkpoint_with_graph_coupling(cfg: TrainConfig, source_ckpt_path: str
         edge_index=edge_index,
         gnn_hidden_dim=cfg.gnn_hidden,
         gnn_num_layers=cfg.gnn_layers,
+        **_graph_bases_extra_kwargs(cfg),
     )
 
     target_ckpt_path = os.path.join(cfg.work_dir, "checkpoints/last.ckpt")
