@@ -216,8 +216,10 @@ class TrainConfig:
     graph_coupling_path: str | None = None
     gnn_hidden: int = 128
     gnn_layers: int = 2
-    # only used by gnn_variant == "relative_velocity_linear_attention" (number
-    # of attention heads; hidden_dim must be divisible by this).
+    # only used by gnn_variant in {"relative_attention",
+    # "relative_velocity_linear_attention",
+    # "relative_velocity_linear_attention_multihead"} (number of attention
+    # heads; hidden_dim must be divisible by this).
     gnn_heads: int = 4
     # "absolute" (flow3d/graph_coupling.py, ClusterGraphGNN): message passing
     # mean-aggregates neighbors' raw hidden features.
@@ -246,15 +248,26 @@ class TrainConfig:
     # GAT-style attention (softmax over each receiver's in-neighbors, edge
     # feature included in the attention score) instead of a uniform
     # (1/in_degree) mean. gnn_heads controls the number of attention heads.
+    # "relative_velocity_linear_attention_multihead"
+    # (flow3d/graph_relative_linear_attention_multihead.py,
+    # RelativeVelLinearAttentionMultiHeadClusterGraphGNN): same as
+    # "relative_velocity_linear_attention" (same node/edge features, same
+    # attention score/softmax), but the message MLP itself is now per-head
+    # independent (each head has its own small MLP mapping
+    # [h_j - h_i, e_ij] -> head_dim) instead of one shared MLP whose output
+    # is merely reshaped into heads. gnn_heads controls the number of heads
+    # (and hence independent message MLPs).
     # Only affects how graph-coupling messages are built; everything else
     # (topology, hidden_dim, num_layers, output dim, loss, optimizer) is
-    # identical, so all five are a fair ablation of each other.
+    # identical, so all six are a fair ablation of each other.
     gnn_variant: Literal[
         "absolute",
         "relative",
+        "relative_attention",
         "relative_velocity_linear",
         "relative_velocity_angular",
         "relative_velocity_linear_attention",
+        "relative_velocity_linear_attention_multihead",
     ] = "absolute"
 
     # Training
