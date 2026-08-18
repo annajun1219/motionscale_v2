@@ -70,9 +70,14 @@ def _graph_corrected_bases_cls(gnn_variant: str):
     RelativeVelocityAngularGraphCorrectedScalableMotionBases,
     "relative_velocity_linear_attention" ->
     flow3d/graph_relative_linear_attention.py's
-    RelativeVelLinearAttentionGraphCorrectedScalableMotionBases). All five
-    share the exact same constructor/from_scalable_motion_bases signature
-    (modulo the attention variant's extra gnn_num_heads kwarg, see
+    RelativeVelLinearAttentionGraphCorrectedScalableMotionBases,
+    "relative_velocity_linear_attention_multihead" ->
+    flow3d/graph_relative_linear_attention_multihead.py's
+    RelativeVelLinearAttentionMultiHeadGraphCorrectedScalableMotionBases, same
+    as the attention variant but with a per-head independent message MLP
+    instead of a shared one). All six share the exact same
+    constructor/from_scalable_motion_bases signature (modulo the two
+    attention variants' extra gnn_num_heads kwarg, see
     _graph_bases_extra_kwargs), so callers can swap the class without
     touching the rest of the wrapping code.
     """
@@ -82,6 +87,12 @@ def _graph_corrected_bases_cls(gnn_variant: str):
         )
 
         return RelativeGraphCorrectedScalableMotionBases
+    elif gnn_variant == "relative_attention":
+        from flow3d.graph_coupling_relative_attention import (
+            RelativeAttentionGraphCorrectedScalableMotionBases,
+        )
+
+        return RelativeAttentionGraphCorrectedScalableMotionBases
     elif gnn_variant == "relative_velocity_linear":
         from flow3d.graph_relative_velocity_linear import (
             RelativeVelocityLinearGraphCorrectedScalableMotionBases,
@@ -100,6 +111,12 @@ def _graph_corrected_bases_cls(gnn_variant: str):
         )
 
         return RelativeVelLinearAttentionGraphCorrectedScalableMotionBases
+    elif gnn_variant == "relative_velocity_linear_attention_multihead":
+        from flow3d.graph_relative_linear_attention_multihead import (
+            RelativeVelLinearAttentionMultiHeadGraphCorrectedScalableMotionBases,
+        )
+
+        return RelativeVelLinearAttentionMultiHeadGraphCorrectedScalableMotionBases
     elif gnn_variant == "absolute":
         from flow3d.graph_coupling import GraphCorrectedScalableMotionBases
 
@@ -110,10 +127,14 @@ def _graph_corrected_bases_cls(gnn_variant: str):
 
 def _graph_bases_extra_kwargs(cfg: TrainConfig) -> dict:
     """Extra from_scalable_motion_bases kwargs specific to some gnn_variant
-    values (currently just gnn_num_heads for the attention variant -- every
+    values (currently just gnn_num_heads for the attention variants -- every
     other variant's from_scalable_motion_bases takes no extra args beyond
     edge_index/gnn_hidden_dim/gnn_num_layers)."""
-    if cfg.gnn_variant == "relative_velocity_linear_attention":
+    if cfg.gnn_variant in {
+        "relative_attention",
+        "relative_velocity_linear_attention",
+        "relative_velocity_linear_attention_multihead",
+    }:
         return {"gnn_num_heads": cfg.gnn_heads}
     return {}
 
