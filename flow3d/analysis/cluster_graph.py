@@ -98,6 +98,9 @@ class ClusterGraphConfig:
     # Kept iff the smoothed, confidence-weighted max all-frames gap <
     # contact_distance * keep_multiplier.
     keep_multiplier: float = 1.5
+    # Per-frame gap statistic passed to compute_all_frames_gap; see its
+    # gap_percentile docstring. 0 (default) = plain single-nearest-pair gap.
+    gap_percentile: float = 0.0
     # Temporal window (frames) for confidence-weighted smoothing of the
     # per-frame gap sequence before taking its max; see smooth_and_summarize_gap.
     # 1 disables smoothing (still confidence-weighted: zero-confidence frames
@@ -291,6 +294,7 @@ def compute_all_frames_gap(
     boundary_global_indices_b: np.ndarray,
     positions_all_frames: np.ndarray,
     confidences_all_frames: np.ndarray | None = None,
+    gap_percentile: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Per-frame nearest-neighbor gap between two (generous) candidate point
@@ -311,8 +315,17 @@ def compute_all_frames_gap(
         in [0, 1] (e.g. raw-track confidence), aligned with positions_all_frames.
         None (e.g. positions from a learned motion basis, which has no
         natural per-frame confidence) is treated as uniform confidence 1.0.
+    :param gap_percentile: 0 (default) uses the single closest pair each
+        frame (the plain nearest-neighbor gap). >0 instead takes that
+        percentile (e.g. 10 for "p10") of the combined a->b and b->a
+        nearest-neighbor distance distribution -- robust to one outlier
+        near-touching point (e.g. a stray boundary Gaussian or a raw-track
+        mismatch) creating a spuriously tight single-pair gap when the two
+        clusters' surfaces aren't actually broadly close. Confidence is
+        read off the same point that achieved the reported percentile
+        distance, not averaged separately.
     :return: (gap_t, confidence_t), both (T,). confidence_t is the weaker
-        (min) of the two points that achieved that frame's minimum gap.
+        (min) of the two points that achieved that frame's reported gap.
     """
     pts_a = positions_all_frames[boundary_global_indices_a]  # (m, T, 3)
     pts_b = positions_all_frames[boundary_global_indices_b]  # (n, T, 3)
@@ -321,18 +334,36 @@ def compute_all_frames_gap(
     gap_t = np.empty(T, dtype=np.float64)
     confidence_t = np.empty(T, dtype=np.float64)
     for t in range(T):
-        tree = cKDTree(pts_b[:, t, :])
-        dist, idx = tree.query(pts_a[:, t, :], k=1)
-        a_star = int(np.argmin(dist))
-        b_star = int(idx[a_star])
-        gap_t[t] = dist[a_star]
+        a_t = pts_a[:, t, :]
+        b_t = pts_b[:, t, :]
+
+        dist_ab, idx_ab = cKDTree(b_t).query(a_t, k=1)  # (m,): a -> nearest b
+        dist_ba, idx_ba = cKDTree(a_t).query(b_t, k=1)  # (n,): b -> nearest a
 
         if confidences_all_frames is None:
-            confidence_t[t] = 1.0
+            conf_a_own = np.ones(len(boundary_global_indices_a))
+            conf_b_own = np.ones(len(boundary_global_indices_b))
         else:
-            conf_a = confidences_all_frames[boundary_global_indices_a[a_star], t]
-            conf_b = confidences_all_frames[boundary_global_indices_b[b_star], t]
-            confidence_t[t] = min(float(conf_a), float(conf_b))
+            conf_a_own = confidences_all_frames[boundary_global_indices_a, t]
+            conf_b_own = confidences_all_frames[boundary_global_indices_b, t]
+        # confidence of each nearest-neighbor pair = weaker of its two points.
+        conf_ab = np.minimum(conf_a_own, conf_b_own[idx_ab])
+        conf_ba = np.minimum(conf_b_own, conf_a_own[idx_ba])
+
+        combined_dist = np.concatenate([dist_ab, dist_ba])
+        combined_conf = np.concatenate([conf_ab, conf_ba])
+
+        if gap_percentile <= 0.0:
+            k = int(np.argmin(combined_dist))
+        else:
+            # Nearest-rank (not interpolated) so the reported gap is an
+            # actual measured distance, with a real point pair -- and
+            # therefore a real confidence -- behind it.
+            rank = int(round((gap_percentile / 100.0) * (len(combined_dist) - 1)))
+            k = int(np.argsort(combined_dist)[rank])
+
+        gap_t[t] = combined_dist[k]
+        confidence_t[t] = combined_conf[k]
 
     return gap_t, confidence_t
 
@@ -392,6 +423,8 @@ def build_cluster_graph(
     contact_distance: float,
     config: ClusterGraphConfig | None = None,
     confidences_all_frames: np.ndarray | None = None,
+    force_include_pairs: set[tuple[int, int]] | None = None,
+    force_exclude_pairs: set[tuple[int, int]] | None = None,
 ) -> ClusterGraphResult:
     """
     Build the offline cluster-connectivity graph.
@@ -408,8 +441,23 @@ def build_cluster_graph(
         in [0, 1], aligned with positions_all_frames. None (e.g. positions
         from a learned motion basis) is treated as uniform confidence 1.0 --
         the gap summary is then plain confidence-*un*weighted smoothing.
+    :param force_include_pairs: Canonical ``(min_id, max_id)`` pairs that are
+        evaluated and kept regardless of the automatic gates.
+    :param force_exclude_pairs: Canonical pairs that are evaluated and cut
+        regardless of the automatic gates.
     """
     config = config or ClusterGraphConfig()
+    force_include_pairs = force_include_pairs or set()
+    force_exclude_pairs = force_exclude_pairs or set()
+    overlap = force_include_pairs & force_exclude_pairs
+    if overlap:
+        raise ValueError(f"Pairs cannot be both force-included and force-excluded: {sorted(overlap)}")
+
+    valid_ids = set(cluster_ids)
+    override_ids = {cid for pair in force_include_pairs | force_exclude_pairs for cid in pair}
+    unknown_ids = override_ids - valid_ids
+    if unknown_ids:
+        raise ValueError(f"Override pairs contain invalid cluster ids: {sorted(unknown_ids)}")
 
     boundary_max_distance = (
         config.boundary_max_distance
@@ -424,10 +472,20 @@ def build_cluster_graph(
     )
     cluster_row = {cid: i for i, cid in enumerate(cluster_ids)}
     candidate_pairs, candidate_info = find_candidate_pairs(cluster_ids, centers_ts, radius)
+    # Explicit overrides are evaluated even when the automatic center-radius
+    # prefilter would not have selected them.
+    candidate_pairs = sorted(set(candidate_pairs) | force_include_pairs | force_exclude_pairs)
 
     edges: list[ClusterPairEdge] = []
     for a, b in candidate_pairs:
-        t_star, center_distance = candidate_info[(a, b)]
+        if (a, b) in candidate_info:
+            t_star, center_distance = candidate_info[(a, b)]
+        else:
+            center_distances = np.linalg.norm(
+                centers_ts[cluster_row[a]] - centers_ts[cluster_row[b]], axis=-1
+            )
+            t_star = int(np.argmin(center_distances))
+            center_distance = float(center_distances[t_star])
         global_a = global_indices_by_cluster[a]
         global_b = global_indices_by_cluster[b]
 
@@ -450,6 +508,7 @@ def build_cluster_graph(
 
         gap_t, confidence_t = compute_all_frames_gap(
             boundary_a, boundary_b, positions_all_frames, confidences_all_frames,
+            gap_percentile=config.gap_percentile,
         )
         gap_summary = smooth_and_summarize_gap(
             gap_t, confidence_t, config.gap_smoothing_window,
@@ -497,6 +556,13 @@ def build_cluster_graph(
         else:
             kept = gap_summary < threshold
             reason = "kept_all_frames_contact" if kept else "cut_gap_exceeds_threshold"
+
+        if (a, b) in force_include_pairs:
+            kept = True
+            reason = "kept_manual_override"
+        elif (a, b) in force_exclude_pairs:
+            kept = False
+            reason = "cut_manual_override"
 
         edges.append(
             ClusterPairEdge(

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Quantify what the graph-coupling GNN (flow3d/graph_coupling.py /
-flow3d/graph_coupling_relative.py) actually changes on a trained checkpoint.
+Quantify what the graph-coupling GNN (flow3d/graph_coupling.py) actually changes on a trained checkpoint.
 
 Motivation
 ----------

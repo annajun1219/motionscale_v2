@@ -6,6 +6,7 @@ from gsplat.rendering import rasterization, rasterization_2dgs
 from torch import Tensor
 
 from flow3d.params import GaussianParams, MotionBases, ScalableMotionBases, CameraPoses
+from flow3d.graph_relative_edge import EdgeBoundaryGraphCorrectedScalableMotionBases
 
 
 class SceneModel(nn.Module):
@@ -104,7 +105,19 @@ class SceneModel(nn.Module):
             coefs = coefs[inds]
             if cluster_ids is not None:
                 cluster_ids = cluster_ids[inds]
-        transfms = self.motion_bases.compute_transforms(ts, coefs, cluster_ids)  # (G, B, 3, 4)
+        if isinstance(self.motion_bases, EdgeBoundaryGraphCorrectedScalableMotionBases):
+            # Its per-Gaussian boundary correction is keyed by global identity
+            # (not just cluster id), so it needs to know which canonical
+            # Gaussian each queried row actually is -- see
+            # flow3d/graph_relative_edge.py's compute_transforms docstring.
+            global_indices = (
+                inds if inds is not None else torch.arange(coefs.shape[0], device=coefs.device)
+            )
+            transfms = self.motion_bases.compute_transforms(
+                ts, coefs, cluster_ids, global_indices=global_indices
+            )  # (G, B, 3, 4)
+        else:
+            transfms = self.motion_bases.compute_transforms(ts, coefs, cluster_ids)  # (G, B, 3, 4)
         return transfms
 
     def compute_poses_fg(
@@ -235,117 +248,42 @@ class SceneModel(nn.Module):
                 state_dict, prefix=f"{prefix}bg."
             )
         gnn_prefix = f"{prefix}motion_bases.gnn."
-        if any(k.startswith(gnn_prefix) for k in state_dict):
-            # flow3d/graph_coupling.py / flow3d/graph_coupling_relative.py /
-            # flow3d/graph_coupling_relative_attention.py /
-            # flow3d/graph_relative_velocity_linear.py /
-            # flow3d/graph_relative_velocity_angular.py /
-            # flow3d/graph_relative_linear_attention.py /
-            # flow3d/graph_relative_linear_attention_multihead.py: coarse
-            # transform is corrected by a message-passing GNN on top of a
-            # ScalableMotionBases. Same reasoning as above -- the correction
-            # lives in the "gnn" submodule, not in params, so it must be
-            # reconstructed explicitly. The seven variants share the "gnn."
-            # prefix, so tell them apart by their message-layer submodule
-            # names and buffers: RelativeClusterGraphGNN-family stores its MLP
-            # under "layers.<i>.mlp." (baseline ClusterGraphGNN's _MeanAggLayer
-            # uses "layers.<i>.lin." instead), RelativeVelocityLinearClusterGraphGNN
-            # additionally has a "vel_scale" buffer that plain
-            # RelativeClusterGraphGNN doesn't, RelativeVelocityAngularClusterGraphGNN
-            # additionally has an "ang_vel_scale" buffer on top of that. Both
-            # RelativeAttentionClusterGraphGNN and RelativeVelLinearAttentionClusterGraphGNN
-            # replace the mean-aggregation layer with an attention layer that
-            # has a "layers.<i>.W_score." submodule -- that alone doesn't tell
-            # them apart, since only the velocity one also has a "vel_scale"
-            # buffer (like velocity_linear) while the non-velocity one has
-            # neither "vel_scale" nor "ang_vel_scale". RelativeVelLinearAttentionMultiHeadClusterGraphGNN
-            # is velocity-linear-attention with a per-head message MLP: it
-            # stores its message MLPs under "layers.<i>.msg_mlps." instead of
-            # the single shared "layers.<i>.mlp." -- check that first, since
-            # it would otherwise also match the (single-MLP)
-            # velocity-linear-attention signature. Check the most specific
-            # signature first (angular, then velocity-attention-multihead,
-            # then velocity-attention, then plain attention, then
-            # velocity-linear, then plain relative).
+        if f"{prefix}motion_bases.edge_cluster_a" in state_dict:
+            # flow3d/graph_relative_edge.py: per-edge boundary correction
+            # (translation-only, applied only near cluster-pair boundaries).
+            # Its own top-level "edge_cluster_a" buffer (not nested under
+            # ".gnn.") is a marker distinct from the per-cluster
+            # relative_velocity_linear_attention format below.
+            motion_bases = EdgeBoundaryGraphCorrectedScalableMotionBases.init_from_state_dict(
+                state_dict, prefix=f"{prefix}motion_bases."
+            )
+        elif any(k.startswith(gnn_prefix) for k in state_dict):
+            # The repository supports one per-cluster graph-corrected checkpoint
+            # format: relative motion + linear velocity + shared-message multi-head attention.
             has_attention = any(
                 k.startswith(f"{gnn_prefix}layers.") and ".W_score." in k
                 for k in state_dict
             )
             has_vel_scale = f"{gnn_prefix}vel_scale" in state_dict
-            has_msg_mlps = any(
-                k.startswith(f"{gnn_prefix}layers.") and ".msg_mlps." in k
+            has_shared_message_mlp = any(
+                k.startswith(f"{gnn_prefix}layers.") and ".mlp." in k
                 for k in state_dict
             )
-            is_velocity_angular = f"{gnn_prefix}ang_vel_scale" in state_dict
-            is_velocity_linear_attention_multihead = (
-                has_attention and has_vel_scale and has_msg_mlps
+            if not (has_attention and has_vel_scale and has_shared_message_mlp):
+                raise ValueError(
+                    "Unsupported graph-coupled checkpoint: expected the "
+                    "relative_velocity_linear_attention GNN state format."
+                )
+
+            from flow3d.graph_relative_linear_attention import (
+                RelativeVelLinearAttentionGraphCorrectedScalableMotionBases,
             )
-            is_velocity_linear_attention = (
-                has_attention and has_vel_scale and not has_msg_mlps
+
+            motion_bases = (
+                RelativeVelLinearAttentionGraphCorrectedScalableMotionBases.init_from_state_dict(
+                    state_dict, prefix=f"{prefix}motion_bases."
+                )
             )
-            is_relative_attention = has_attention and not has_vel_scale
-            is_velocity_linear = has_vel_scale and not has_attention
-            is_relative = (
-                any(
-                    k.startswith(f"{gnn_prefix}layers.") and ".mlp." in k
-                    for k in state_dict
-                )
-                and not has_attention
-            )
-            if is_velocity_angular:
-                from flow3d.graph_relative_velocity_angular import (
-                    RelativeVelocityAngularGraphCorrectedScalableMotionBases,
-                )
-
-                motion_bases = RelativeVelocityAngularGraphCorrectedScalableMotionBases.init_from_state_dict(
-                    state_dict, prefix=f"{prefix}motion_bases."
-                )
-            elif is_velocity_linear_attention_multihead:
-                from flow3d.graph_relative_linear_attention_multihead import (
-                    RelativeVelLinearAttentionMultiHeadGraphCorrectedScalableMotionBases,
-                )
-
-                motion_bases = RelativeVelLinearAttentionMultiHeadGraphCorrectedScalableMotionBases.init_from_state_dict(
-                    state_dict, prefix=f"{prefix}motion_bases."
-                )
-            elif is_velocity_linear_attention:
-                from flow3d.graph_relative_linear_attention import (
-                    RelativeVelLinearAttentionGraphCorrectedScalableMotionBases,
-                )
-
-                motion_bases = RelativeVelLinearAttentionGraphCorrectedScalableMotionBases.init_from_state_dict(
-                    state_dict, prefix=f"{prefix}motion_bases."
-                )
-            elif is_relative_attention:
-                from flow3d.graph_coupling_relative_attention import (
-                    RelativeAttentionGraphCorrectedScalableMotionBases,
-                )
-
-                motion_bases = RelativeAttentionGraphCorrectedScalableMotionBases.init_from_state_dict(
-                    state_dict, prefix=f"{prefix}motion_bases."
-                )
-            elif is_velocity_linear:
-                from flow3d.graph_relative_velocity_linear import (
-                    RelativeVelocityLinearGraphCorrectedScalableMotionBases,
-                )
-
-                motion_bases = RelativeVelocityLinearGraphCorrectedScalableMotionBases.init_from_state_dict(
-                    state_dict, prefix=f"{prefix}motion_bases."
-                )
-            elif is_relative:
-                from flow3d.graph_coupling_relative import (
-                    RelativeGraphCorrectedScalableMotionBases,
-                )
-
-                motion_bases = RelativeGraphCorrectedScalableMotionBases.init_from_state_dict(
-                    state_dict, prefix=f"{prefix}motion_bases."
-                )
-            else:
-                from flow3d.graph_coupling import GraphCorrectedScalableMotionBases
-
-                motion_bases = GraphCorrectedScalableMotionBases.init_from_state_dict(
-                    state_dict, prefix=f"{prefix}motion_bases."
-                )
         elif f"{prefix}motion_bases.params.fine_rots" in state_dict:
             motion_bases = ScalableMotionBases.init_from_state_dict(state_dict, prefix=f"{prefix}motion_bases.params.")
         else:

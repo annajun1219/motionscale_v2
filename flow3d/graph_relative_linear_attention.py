@@ -1,9 +1,9 @@
 """
 flow3d/graph_relative_linear_attention.py
 
-flow3d/graph_relative_velocity_linear.py의 확장: node/edge feature(linear
-velocity 포함, 15/15차원)는 그대로 유지한 채, message passing의 이웃 합치는
-방식만 mean aggregation에서 학습된 multi-head attention(GAT류)으로 바꾼다.
+Relative motion/geometry와 linear velocity를 node/edge feature(각 15차원)로
+사용하고, 이웃 message를 학습된 multi-head attention(GAT류)으로 합치는 독립
+구현이다.
 Angular velocity와 temporal smoothness loss는 이 파일의 범위 밖이다.
 
 mean aggregation -> attention aggregation
@@ -61,18 +61,13 @@ head(omega/delta_t를 내는 마지막 Linear)는 여전히 0으로 초기화된
 GNN 전체 출력(omega, delta_t)은 attention 가중치와 무관하게 정확히 0이다 --
 zero-init 등가성은 attention 도입과 무관하게 그대로 보존된다.
 
-이 파일에서 바뀌지 않는 것 (재구현하지 않고 import)
-------------------------------------------------------
+공통 기반
+---------
 - so3_exp_map / compose_rotation / build_edge_index_from_edges_pt / cont_6d_to_rmat
-  / rmat_to_cont_6d / CENTER_DIM / ROT_DIM / TRANSL_DIM / NODE_FEAT_DIM: 기존
-  flow3d/graph_coupling.py 구현을 그대로 가져다 쓴다.
-- _build_directed_neighbor_edges: flow3d/graph_coupling_relative.py 구현을
-  그대로 가져다 쓴다 (topology 구성은 이 확장으로 바뀌지 않는다).
-- NODE_FEAT_DIM_VEL / EDGE_FEAT_DIM_VEL / VEL_DIM / _compute_vel_scale: linear
-  velocity 관련 상수/로직은 flow3d/graph_relative_velocity_linear.py의 구현을
-  그대로 가져다 쓴다 (재구현하지 않는다). node/edge feature 자체의 내용과
-  차원(15/15)은 이 파일에서 전혀 바뀌지 않는다 -- 바뀌는 건 message를 합치는
-  방식(mean -> attention)뿐이다.
+  / rmat_to_cont_6d / CENTER_DIM / ROT_DIM / TRANSL_DIM / NODE_FEAT_DIM은
+  flow3d/graph_coupling.py에서 가져다 쓴다.
+- directed neighbor topology 생성과 linear-velocity feature 차원/정규화는 이
+  파일에 직접 구현하여 다른 GNN variant 모듈에 의존하지 않는다.
 - coarse correction 합성 수식(R_new = exp(omega) @ R_coarse, t_new = t_coarse +
   delta_t), coarse-to-fine 결합 수식, checkpoint save/load 포맷은 baseline
   relative/velocity_linear와 동일하다.
@@ -106,16 +101,6 @@ from flow3d.graph_coupling import (
     compose_rotation,
     so3_exp_map,
 )
-from flow3d.graph_coupling_relative import (
-    EDGE_FEAT_DIM,
-    _build_directed_neighbor_edges,
-)
-from flow3d.graph_relative_velocity_linear import (
-    EDGE_FEAT_DIM_VEL,
-    NODE_FEAT_DIM_VEL,
-    VEL_DIM,
-    _compute_vel_scale,
-)
 from flow3d.params import ScalableMotionBases
 from flow3d.transforms import cont_6d_to_rmat, rmat_to_cont_6d
 
@@ -128,13 +113,43 @@ __all__ = [
 ]
 
 _LEAKY_SLOPE = 0.2
+VEL_DIM = 3
+EDGE_FEAT_DIM = TRANSL_DIM + CENTER_DIM + ROT_DIM
+NODE_FEAT_DIM_VEL = NODE_FEAT_DIM + VEL_DIM
+EDGE_FEAT_DIM_VEL = EDGE_FEAT_DIM + VEL_DIM
+
+
+def _build_directed_neighbor_edges(
+    edge_index: torch.Tensor, num_clusters: int
+) -> torch.Tensor:
+    """Convert undirected cluster pairs to deduplicated directed edges."""
+    del num_clusters  # Kept in the signature for construction-call compatibility.
+    if edge_index.numel() == 0:
+        return torch.empty(2, 0, dtype=torch.long, device=edge_index.device)
+
+    src, dst = edge_index[0], edge_index[1]
+    keep = src != dst
+    src, dst = src[keep], dst[keep]
+    directed = torch.stack(
+        [torch.cat([src, dst]), torch.cat([dst, src])], dim=0
+    )
+    return torch.unique(directed, dim=1)
+
+
+def _compute_vel_scale(transls: torch.Tensor) -> float:
+    """Return a stable scale for frame-to-frame coarse translation deltas."""
+    if transls.shape[1] < 2:
+        return 1.0
+    scale = (transls[:, 1:] - transls[:, :-1]).std().item()
+    if not math.isfinite(scale) or scale <= 0.0:
+        return 1.0
+    return scale
 
 
 class _RelativeVelLinearAttentionMessageLayer(nn.Module):
     """Fixed-topology relative message passing, 1 layer, residual -- same
-    message MLP as flow3d/graph_relative_velocity_linear.py's
-    _RelativeVelocityLinearMessageLayer, but aggregated with learned
-    multi-head attention instead of a uniform (1/in_degree) mean:
+    message MLP aggregated with learned multi-head attention instead of a uniform
+    (1/in_degree) mean:
 
         m_ij     = MLP([h_j - h_i, e_ij])
         s_ij     = LeakyReLU(a^T [W h_i, W h_j, W_e e_ij])   (per head)
@@ -304,7 +319,7 @@ class RelativeVelLinearAttentionClusterGraphGNN(nn.Module):
     ) -> torch.Tensor:
         """directed edge j->i마다
         e_ij = [t_j - t_i, c_j - c_i, rot6d(R_i^T @ R_j), v_j/vel_scale - v_i/vel_scale]
-        를 만든다 (flow3d/graph_relative_velocity_linear.py와 동일). 한 forward
+        를 만든다. 한 forward
         call 안에서 한 번만 계산되어 모든 layer에 재사용된다.
 
         :param vel_scaled: (C, B, 3) 이미 vel_scale로 나뉜 절대 속도.
@@ -690,7 +705,7 @@ if __name__ == "__main__":
     assert head_grad_norm > 0.0, "GNN head should receive nonzero gradient -- it will actually train"
     # Encoder/message-passing/attention layers are (correctly) gradient-starved
     # at init: the zero-initialized head multiplies their contribution by zero
-    # in dL/dW, same reasoning as flow3d/graph_relative_velocity_linear.py.
+    # in dL/dW because the output head is exactly zero.
     assert attn_grad_norm_at_init == 0.0, "attention params should also be zero-grad while head is exactly zero"
 
     with torch.no_grad():

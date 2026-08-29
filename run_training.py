@@ -60,83 +60,43 @@ set_seed(42)
 
 
 def _graph_corrected_bases_cls(gnn_variant: str):
-    """Resolve which *GraphCorrectedScalableMotionBases class implements
-    cfg.gnn_variant ("absolute" -> flow3d/graph_coupling.py's
-    GraphCorrectedScalableMotionBases, "relative" -> flow3d/graph_coupling_relative.py's
-    RelativeGraphCorrectedScalableMotionBases, "relative_velocity_linear" ->
-    flow3d/graph_relative_velocity_linear.py's
-    RelativeVelocityLinearGraphCorrectedScalableMotionBases,
-    "relative_velocity_angular" -> flow3d/graph_relative_velocity_angular.py's
-    RelativeVelocityAngularGraphCorrectedScalableMotionBases,
-    "relative_velocity_linear_attention" ->
-    flow3d/graph_relative_linear_attention.py's
-    RelativeVelLinearAttentionGraphCorrectedScalableMotionBases,
-    "relative_velocity_linear_attention_multihead" ->
-    flow3d/graph_relative_linear_attention_multihead.py's
-    RelativeVelLinearAttentionMultiHeadGraphCorrectedScalableMotionBases, same
-    as the attention variant but with a per-head independent message MLP
-    instead of a shared one). All six share the exact same
-    constructor/from_scalable_motion_bases signature (modulo the two
-    attention variants' extra gnn_num_heads kwarg, see
-    _graph_bases_extra_kwargs), so callers can swap the class without
-    touching the rest of the wrapping code.
-    """
-    if gnn_variant == "relative":
-        from flow3d.graph_coupling_relative import (
-            RelativeGraphCorrectedScalableMotionBases,
-        )
-
-        return RelativeGraphCorrectedScalableMotionBases
-    elif gnn_variant == "relative_attention":
-        from flow3d.graph_coupling_relative_attention import (
-            RelativeAttentionGraphCorrectedScalableMotionBases,
-        )
-
-        return RelativeAttentionGraphCorrectedScalableMotionBases
-    elif gnn_variant == "relative_velocity_linear":
-        from flow3d.graph_relative_velocity_linear import (
-            RelativeVelocityLinearGraphCorrectedScalableMotionBases,
-        )
-
-        return RelativeVelocityLinearGraphCorrectedScalableMotionBases
-    elif gnn_variant == "relative_velocity_angular":
-        from flow3d.graph_relative_velocity_angular import (
-            RelativeVelocityAngularGraphCorrectedScalableMotionBases,
-        )
-
-        return RelativeVelocityAngularGraphCorrectedScalableMotionBases
-    elif gnn_variant == "relative_velocity_linear_attention":
+    """Resolve the graph-correction implementation selected by --gnn_variant."""
+    if gnn_variant == "relative_velocity_linear_attention":
         from flow3d.graph_relative_linear_attention import (
             RelativeVelLinearAttentionGraphCorrectedScalableMotionBases,
         )
 
         return RelativeVelLinearAttentionGraphCorrectedScalableMotionBases
-    elif gnn_variant == "relative_velocity_linear_attention_multihead":
-        from flow3d.graph_relative_linear_attention_multihead import (
-            RelativeVelLinearAttentionMultiHeadGraphCorrectedScalableMotionBases,
+
+    if gnn_variant == "relative_edge_boundary":
+        from flow3d.graph_relative_edge import (
+            EdgeBoundaryGraphCorrectedScalableMotionBases,
         )
 
-        return RelativeVelLinearAttentionMultiHeadGraphCorrectedScalableMotionBases
-    elif gnn_variant == "absolute":
-        from flow3d.graph_coupling import GraphCorrectedScalableMotionBases
+        return EdgeBoundaryGraphCorrectedScalableMotionBases
 
-        return GraphCorrectedScalableMotionBases
-    else:
-        raise ValueError(f"Unknown gnn_variant: {gnn_variant!r}")
+    raise ValueError(
+        f"Unsupported gnn_variant: {gnn_variant!r}; expected "
+        "'relative_velocity_linear_attention' or 'relative_edge_boundary'"
+    )
 
 
-def _graph_bases_extra_kwargs(cfg: TrainConfig) -> dict:
-    """Extra from_scalable_motion_bases kwargs specific to some gnn_variant
-    values (currently just gnn_num_heads for the attention variants -- every
-    other variant's from_scalable_motion_bases takes no extra args beyond
-    edge_index/gnn_hidden_dim/gnn_num_layers)."""
-    if cfg.gnn_variant in {
-        "relative_attention",
-        "relative_velocity_linear_attention",
-        "relative_velocity_linear_attention_multihead",
-    }:
-        return {"gnn_num_heads": cfg.gnn_heads}
-    return {}
+def _graph_bases_extra_kwargs(cfg: TrainConfig, canonical_means: torch.Tensor, cluster_ids_all: torch.Tensor) -> dict:
+    """Arguments specific to the selected gnn_variant's from_scalable_motion_bases.
+
+    :param canonical_means: (G, 3) canonical foreground Gaussian means (e.g.
+        fg_params.params["means"].detach() or model.fg.params["means"].detach()).
+    :param cluster_ids_all: (G,) canonical foreground Gaussian cluster ids,
+        same order as canonical_means.
+    """
+    if cfg.gnn_variant == "relative_edge_boundary":
+        return {
+            "edges_path": cfg.graph_coupling_path,
+            "canonical_means": canonical_means,
+            "cluster_ids_all": cluster_ids_all,
+            "falloff_radius": cfg.boundary_falloff_radius,
+        }
+    return {"gnn_num_heads": cfg.gnn_heads}
 
 
 def get_git_info() -> str:
@@ -435,7 +395,11 @@ def initialize_and_checkpoint_model(
             edge_index=edge_index,
             gnn_hidden_dim=cfg.gnn_hidden,
             gnn_num_layers=cfg.gnn_layers,
-            **_graph_bases_extra_kwargs(cfg),
+            **_graph_bases_extra_kwargs(
+                cfg,
+                fg_params.params["means"].detach(),
+                fg_params.get_cluster_ids().reshape(-1).long(),
+            ),
         ).to(device)
         guru.info(
             f"Graph coupling enabled: wrapped motion_bases with "
@@ -516,7 +480,11 @@ def _wrap_checkpoint_with_graph_coupling(cfg: TrainConfig, source_ckpt_path: str
         edge_index=edge_index,
         gnn_hidden_dim=cfg.gnn_hidden,
         gnn_num_layers=cfg.gnn_layers,
-        **_graph_bases_extra_kwargs(cfg),
+        **_graph_bases_extra_kwargs(
+            cfg,
+            model.fg.params["means"].detach(),
+            model.fg.get_cluster_ids().reshape(-1).long(),
+        ),
     )
 
     target_ckpt_path = os.path.join(cfg.work_dir, "checkpoints/last.ckpt")

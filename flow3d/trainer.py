@@ -24,6 +24,23 @@ from flow3d.loss_utils import (
     center_to_cluster_mean_loss,
     compute_arap_distance_loss,
 )
+from flow3d.analysis.loss import (
+    gnn_correction_magnitude_loss,
+    gnn_correction_smoothness_loss,
+    gnn_correction_edge_consistency_loss,
+)
+from flow3d.analysis.loss_joint import joint_anchor_loss
+from flow3d.analysis.loss_joint_gnn_only import (
+    JointAnchorBoundarySets,
+    build_joint_anchor_boundary_sets,
+    transform_joint_anchor_boundary_sets_gnn_only,
+)
+from flow3d.graph_relative_edge import (
+    EdgeBoundaryGraphCorrectedScalableMotionBases,
+    boundary_magnitude_reg_loss,
+    boundary_magnitude_smoothness_loss,
+    compute_boundary_gap_loss,
+)
 from flow3d.data.utils import compute_depth_normal_mask, to_device
 from flow3d.metrics import PCK, mLPIPS, mPSNR, mSSIM
 from flow3d.scene_model import SceneModel
@@ -84,6 +101,10 @@ class Trainer:
         # cached offline cluster graph (rigidity_graph_type="cluster_graph_file"):
         # loaded once from optim_cfg.rigidity_graph_path, never rebuilt during training.
         self.cluster_graph_knn_idx, self.cluster_graph_valid_mask = None, None
+        # cached joint anchor boundary sets (see
+        # flow3d/analysis/loss_joint_gnn_only.py): loaded once from
+        # optim_cfg.joint_anchor_path, never rebuilt during training.
+        self.joint_anchor_boundary_sets: JointAnchorBoundarySets | None = None
 
         self.work_dir = work_dir
         self.writer = SummaryWriter(log_dir=work_dir)
@@ -967,6 +988,28 @@ class Trainer:
         ts_clamp = torch.clamp(ts, min=1, max=num_frames - 2)
         ts_neighbors = torch.cat((ts_clamp - 1, ts_clamp, ts_clamp + 1))
         transfms_nbs = self.model.compute_transforms(ts_neighbors)  # (G, 3n, 3, 4)
+
+        # GNN correction (t-1, t, t+1) triplet, captured as a side effect of the
+        # compute_transforms(ts_neighbors) call above (None for non-graph-coupled
+        # motion_bases, e.g. plain ScalableMotionBases). See flow3d/analysis/loss.py.
+        gnn_correction_nbs = getattr(self.model.motion_bases, "last_correction", None)
+        if gnn_correction_nbs is not None:
+            n = ts_clamp.shape[0]
+            C_gnn = gnn_correction_nbs["omega"].shape[0]
+            # (C, 3n, 3) -> (C, n, 3, 3): axis=-2 becomes the (t-1, t, t+1) triplet.
+            omega_triplet = gnn_correction_nbs["omega"].reshape(C_gnn, 3, n, 3).permute(0, 2, 1, 3)
+            delta_t_triplet = gnn_correction_nbs["delta_t"].reshape(C_gnn, 3, n, 3).permute(0, 2, 1, 3)
+
+        # Edge-boundary correction (t-1, t, t+1) triplet, same side-effect
+        # capture as gnn_correction_nbs above. See flow3d/graph_relative_edge.py.
+        # None for non-graph-coupled motion_bases or the per-cluster gnn_variant.
+        boundary_correction_nbs = getattr(self.model.motion_bases, "last_boundary_correction", None)
+        if boundary_correction_nbs is not None:
+            n = ts_clamp.shape[0]
+            E_edge = boundary_correction_nbs["magnitude"].shape[0]
+            # (E, 3n) -> (E, n, 3): axis=-1 becomes the (t-1, t, t+1) triplet.
+            boundary_magnitude_triplet = boundary_correction_nbs["magnitude"].reshape(E_edge, 3, n).permute(0, 2, 1)
+
         means_fg_nbs = torch.einsum(
             "pnij,pj->pni",
             transfms_nbs,
@@ -1041,6 +1084,145 @@ class Trainer:
         loss_coarse_align = masked_l1_loss(pos_coarse, positions)
         loss += loss_coarse_align * self.losses_cfg.w_coarse_align
 
+        # GNN correction at the current batch's ts, captured as a side effect
+        # of the compute_transforms_coarse(ts) call just above (overwrites
+        # gnn_correction_nbs, which is why the smoothness loss below reads
+        # from the triplet captured earlier instead of from here).
+        gnn_correction_cur = getattr(self.model.motion_bases, "last_correction", None)
+
+        ## GNN correction (omega, delta_t) regularizers -- see
+        ## flow3d/analysis/loss.py. All no-op (0.0, not computed) for
+        ## non-graph-coupled motion_bases (gnn_correction_cur is None then).
+        gnn_correction_reg_loss = torch.tensor(0.0, device=device)
+        gnn_correction_smooth_loss = torch.tensor(0.0, device=device)
+        gnn_correction_edge_loss = torch.tensor(0.0, device=device)
+        if gnn_correction_cur is not None:
+            omega_cur, delta_t_cur = gnn_correction_cur["omega"], gnn_correction_cur["delta_t"]
+
+            gnn_correction_reg_loss = gnn_correction_magnitude_loss(omega_cur, delta_t_cur)
+            loss += gnn_correction_reg_loss * self.losses_cfg.w_gnn_correction_reg
+
+            if gnn_correction_nbs is not None:
+                gnn_correction_smooth_loss = gnn_correction_smoothness_loss(omega_triplet, delta_t_triplet)
+                loss += gnn_correction_smooth_loss * self.losses_cfg.w_gnn_correction_smooth
+
+            edge_index_dir = getattr(self.model.motion_bases.gnn, "edge_index_dir", None)
+            if edge_index_dir is not None:
+                gnn_correction_edge_loss = gnn_correction_edge_consistency_loss(
+                    omega_cur,
+                    delta_t_cur,
+                    edge_index_dir,
+                    cos_margin=self.losses_cfg.gnn_correction_edge_consistency_cos_margin,
+                )
+                loss += gnn_correction_edge_loss * self.losses_cfg.w_gnn_correction_edge_consistency
+
+        ## Edge-boundary correction (omega-free, per-edge translation
+        ## magnitude) regularizers -- see flow3d/graph_relative_edge.py. Both
+        ## no-op (0.0, not computed) unless motion_bases is
+        ## EdgeBoundaryGraphCorrectedScalableMotionBases
+        ## (--gnn_variant=relative_edge_boundary). Read from the (t-1, t, t+1)
+        ## triplet captured above; the middle frame (index 1) is ts_clamp,
+        ## which equals ts except at the very first/last frame of the sequence.
+        boundary_correction_reg_loss = torch.tensor(0.0, device=device)
+        boundary_correction_smooth_loss = torch.tensor(0.0, device=device)
+        if boundary_correction_nbs is not None:
+            magnitude_cur = boundary_magnitude_triplet[:, :, 1]  # (E, n)
+            boundary_correction_reg_loss = boundary_magnitude_reg_loss(magnitude_cur)
+            loss += boundary_correction_reg_loss * self.losses_cfg.w_boundary_correction_reg
+
+            boundary_correction_smooth_loss = boundary_magnitude_smoothness_loss(boundary_magnitude_triplet)
+            loss += boundary_correction_smooth_loss * self.losses_cfg.w_boundary_correction_smooth
+
+        ## Boundary gap loss: keeps each edge-boundary-corrected cluster pair
+        ## from opening beyond (canonical_distance + tolerance) in the ACTUAL
+        ## rendered (coarse+fine-blended) geometry -- see
+        ## flow3d/graph_relative_edge.py's compute_boundary_gap_loss for the
+        ## hinge/isolation details (only motion_bases.gnn's own parameters get
+        ## gradient from this loss; within tolerance it's exactly 0). Reads
+        ## motion_bases's own (live, densify/cull-refreshed) falloff rows
+        ## directly, so unlike joint_anchor_loss below it needs no separate
+        ## cached boundary set or file path. No-op (0.0, not even computed)
+        ## unless motion_bases is EdgeBoundaryGraphCorrectedScalableMotionBases
+        ## (--gnn_variant=relative_edge_boundary).
+        boundary_gap_loss_value = torch.tensor(0.0, device=device)
+        if isinstance(self.model.motion_bases, EdgeBoundaryGraphCorrectedScalableMotionBases):
+            boundary_gap_loss_value = compute_boundary_gap_loss(
+                self.model.motion_bases,
+                ts,
+                self.model.fg.params["means"].detach(),
+                self.model.fg.get_coefs().detach(),
+                self.model.fg.get_cluster_ids().reshape(-1).long(),
+                tolerance=self.losses_cfg.boundary_gap_tolerance,
+            )
+            loss += boundary_gap_loss_value * self.losses_cfg.w_boundary_gap
+
+        ## Joint anchor loss (GNN-only, true-transform target): keeps each
+        ## cluster pair connected by an edge in the cluster graph
+        ## (optim_cfg.joint_anchor_path -- the SAME build_cluster_graph.py
+        ## edges.pt used for --graph-coupling-path) from opening in the
+        ## ACTUAL rendered (coarse+fine-blended) geometry, while still
+        ## allowing ordinary joint rotation -- see
+        ## flow3d/analysis/loss_joint_gnn_only.py. Measured directly: the
+        ## coarse-only version of this loss (flow3d/analysis/loss_joint.py)
+        ## can converge its own (coarse-only) distance to ~1x canonical
+        ## while the true rendered boundary gap barely moves, since fine
+        ## motion bases are per-cluster and free to diverge at a shared
+        ## boundary regardless of coarse alignment. This version measures
+        ## the true gap and restricts gradient to ONLY motion_bases.gnn's
+        ## own parameters (base coarse motion basis, centers, and fine
+        ## motion are all frozen inputs) -- a deliberate isolation so the
+        ## GNN's own contribution is unambiguous, not because it's expected
+        ## to fully close the gap by itself (a rigid per-cluster correction
+        ## can only close the *coherent* component of a boundary gap; the
+        ## non-rigid remainder needs a separate fine-level treatment, not
+        ## implemented here). No-op (0.0, not even computed) unless
+        ## optim_cfg.joint_anchor_path is set.
+        joint_anchor_loss_value = torch.tensor(0.0, device=device)
+        if self.optim_cfg.joint_anchor_path:
+            if isinstance(self.model.motion_bases, EdgeBoundaryGraphCorrectedScalableMotionBases):
+                raise ValueError(
+                    "optim_cfg.joint_anchor_path targets the per-cluster (omega, delta_t) "
+                    "GNN correction and is not supported with "
+                    "gnn_variant='relative_edge_boundary' -- use "
+                    "optim_cfg.boundary_gap_path instead (see flow3d/graph_relative_edge.py)."
+                )
+            if self.joint_anchor_boundary_sets is None:
+                self.joint_anchor_boundary_sets = build_joint_anchor_boundary_sets(
+                    self.optim_cfg.joint_anchor_path,
+                    self.model.fg.params["means"].detach(),
+                    device=device,
+                )
+                num_clusters = self.model.motion_bases.num_clusters
+                max_cluster_id = int(self.joint_anchor_boundary_sets.cluster_ids.max())
+                if max_cluster_id >= num_clusters:
+                    raise ValueError(
+                        f"{self.optim_cfg.joint_anchor_path} references cluster ids up to "
+                        f"{max_cluster_id}, but the model currently has {num_clusters} "
+                        "clusters (0.."
+                        f"{num_clusters - 1}) -- joint_anchor_path requires the cluster set to "
+                        "stay exactly as it was when the file was built. Pass "
+                        "--optim.no-enable-bases-control."
+                    )
+                guru.info(
+                    f"[joint-anchor] loaded {self.joint_anchor_boundary_sets.num_pairs} joint "
+                    f"anchor pair(s) from edges.pt at {self.optim_cfg.joint_anchor_path}"
+                )
+
+            transformed_anchors = transform_joint_anchor_boundary_sets_gnn_only(
+                self.model.motion_bases,
+                ts,
+                self.joint_anchor_boundary_sets,
+                self.model.fg.params["means"].detach(),
+                self.model.fg.get_coefs().detach(),
+                self.model.fg.get_cluster_ids().reshape(-1).long(),
+            )
+            joint_anchor_loss_value = joint_anchor_loss(
+                transformed_anchors,
+                self.joint_anchor_boundary_sets.canonical_distance,
+                huber_delta=self.losses_cfg.joint_anchor_huber_delta,
+            )
+            loss += joint_anchor_loss_value * self.losses_cfg.w_joint_anchor
+
         ## Rigidity loss (ARAP). update_rigidity_weights() is normally only
         ## triggered as a side effect of _bases_control_step, so this only
         ## ever fires once basis control has been explicitly disabled and
@@ -1081,6 +1263,13 @@ class Trainer:
             "train/loss_center_cano": loss_center_cano.item(),
             "train/loss_coarse_align": loss_coarse_align.item(),
             "train/rigid_body_loss": rigid_body_loss.item(),
+            "train/gnn_correction_reg_loss": gnn_correction_reg_loss.item(),
+            "train/gnn_correction_smooth_loss": gnn_correction_smooth_loss.item(),
+            "train/gnn_correction_edge_loss": gnn_correction_edge_loss.item(),
+            "train/boundary_correction_reg_loss": boundary_correction_reg_loss.item(),
+            "train/boundary_correction_smooth_loss": boundary_correction_smooth_loss.item(),
+            "train/boundary_gap_loss": boundary_gap_loss_value.item(),
+            "train/joint_anchor_loss": joint_anchor_loss_value.item(),
             "train/num_gaussians": self.model.num_gaussians,
             "train/num_fg_gaussians": self.model.num_fg_gaussians,
             "train/num_bg_gaussians": self.model.num_bg_gaussians,
@@ -1248,6 +1437,29 @@ class Trainer:
             and (step + 1) % self.reset_opacity_every == 0
         ):
             self._reset_opacity_control_step()
+
+        # Edge-boundary correction (flow3d/graph_relative_edge.py): densify/cull
+        # above (_densify_control_step/_cull_control_step) run regardless of
+        # cfg.enable_bases_control -- only cluster/motion-basis *count* is
+        # frozen by --optim.no-enable-bases-control, not per-Gaussian adaptive
+        # density control. So the foreground Gaussian array can still be
+        # split/dup'd/culled (reordered and resized) on every control_step,
+        # and motion_bases's falloff rows (which Gaussian belongs to which
+        # edge's boundary, and how much) must be recomputed against the new
+        # array -- refresh_boundary_falloff does this from live positions only
+        # (no stale index dependency), leaving edge topology/anchors untouched.
+        if isinstance(self.model.motion_bases, EdgeBoundaryGraphCorrectedScalableMotionBases):
+            mb = self.model.motion_bases
+            if int(mb.num_fg_gaussians) != self.model.fg.num_gaussians:
+                mb.refresh_boundary_falloff(
+                    self.model.fg.params["means"].detach(),
+                    self.model.fg.get_cluster_ids().reshape(-1).long(),
+                )
+                guru.info(
+                    f"[boundary-falloff] refreshed at {step=}: "
+                    f"num_fg_gaussians={mb.num_fg_gaussians.item()} "
+                    f"falloff_rows={mb.falloff_global_idx.numel()}"
+                )
 
     @torch.no_grad()
     def _prepare_control_step(self) -> bool:

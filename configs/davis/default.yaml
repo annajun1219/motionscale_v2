@@ -1,7 +1,7 @@
 # Base config
 work_dir: 'outputs/davis/'
 dataset: 'davis'
-data_dir: '/path/to/DAVIS/'
+data_dir: '/workspace/motion-scale/data/DAVIS/'
 
 # Cluster init: default is "means" (spatial k-means). To separate spatially-adjacent
 # but independently-moving parts (e.g. a hand resting on a thigh), switch to

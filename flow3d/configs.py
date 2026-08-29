@@ -95,6 +95,64 @@ class LossesConfig:
     w_rigidity: float = 0.5
     use_log_scale_var: bool = True
 
+    ### GNN correction (omega, delta_t) regularizers -- see flow3d/analysis/loss.py.
+    # Only active when motion_bases is one of the *GraphCorrectedScalableMotionBases
+    # classes (--enable_graph_coupling), no-op (0.0 loss, not even computed)
+    # otherwise. All three are 0.0 while the GNN head is still zero-initialized,
+    # so they don't disturb the zero-init-equivalence baseline.
+    # L2 penalty on the correction magnitude, so it stays a small nudge on the
+    # coarse transform rather than a free-floating residual.
+    w_gnn_correction_reg: float = 0.01
+    # second-order (central-difference) temporal smoothness on the correction
+    # across (t-1, t, t+1), independent of the fixed-graph rigidity loss above.
+    w_gnn_correction_smooth: float = 0.01
+    # weak: only penalizes graph-connected clusters whose corrections point in
+    # genuinely opposite directions (see cos_margin below); doesn't restrict
+    # ordinary joint articulation.
+    w_gnn_correction_edge_consistency: float = 0.01
+    gnn_correction_edge_consistency_cos_margin: float = 0.5
+
+    ### Edge-boundary correction (omega-free, per-edge translation magnitude)
+    # regularizers -- see flow3d/graph_relative_edge.py. Only active when
+    # motion_bases is EdgeBoundaryGraphCorrectedScalableMotionBases
+    # (--enable_graph_coupling --gnn_variant=relative_edge_boundary), no-op
+    # (0.0, not even computed) otherwise. Both are 0.0 while the edge head is
+    # still zero-initialized.
+    w_boundary_correction_reg: float = 0.01
+    w_boundary_correction_smooth: float = 0.01
+
+    ### Boundary gap loss -- see flow3d/graph_relative_edge.py's
+    # compute_boundary_gap_loss. Only active (nonzero) when motion_bases is
+    # EdgeBoundaryGraphCorrectedScalableMotionBases
+    # (--gnn_variant=relative_edge_boundary); reads that class's own live,
+    # densify/cull-refreshed boundary state directly, so no separate file path
+    # is needed here. Penalizes the TRUE (coarse+fine-blended) boundary-Gaussian
+    # gap only once
+    # it exceeds (canonical_distance + boundary_gap_tolerance) -- inside the
+    # tolerance band the loss is exactly 0, so ordinary articulation and small
+    # canonical gaps are never fought. Gradient reaches only the edge GNN's
+    # own parameters (base coarse/fine motion is a frozen input), so this loss
+    # can only close the gap via the small localized correction, not by moving
+    # (and thereby distorting) the rest of either cluster.
+    w_boundary_gap: float = 0.1
+    boundary_gap_tolerance: float = 0.01
+
+    ### Joint anchor loss -- see flow3d/analysis/loss_joint.py. Only active when
+    # optim_cfg.joint_anchor_path is set (an edges.pt built by
+    # flow3d/analysis/build_cluster_graph.py -- the SAME file passed to
+    # --graph-coupling-path). Keeps each cluster pair connected by a kept
+    # edge in that graph from opening under the (possibly GNN-corrected)
+    # coarse transform -- e.g. flow3d/graph_relative_linear_attention.py's
+    # RelativeVelLinearAttentionGraphCorrectedScalableMotionBases -- while
+    # still allowing ordinary joint rotation (see loss_joint.py's module
+    # docstring for why rotation about the anchor is unaffected, and for why
+    # edges.pt is used instead of cluster_pairs.py's fixed_boundary_indices.pt).
+    w_joint_anchor: float = 0.1
+    # Huber transition point, in canonical/world scene units: below this the
+    # penalty on (transformed distance - canonical distance) is quadratic,
+    # above it linear, so a few badly-open frames don't dominate the gradient.
+    joint_anchor_huber_delta: float = 0.01
+
 
 @dataclass
 class OptimConfig:
@@ -155,6 +213,18 @@ class OptimConfig:
     # these don't appear in SceneLRConfig since they're not a "fg"/"bg"/"motion_bases"
     # leaf param, so Trainer.configure_optimizers gives them their own param group.
     gnn_lr: float = 1e-3
+    ### Joint anchor loss (see flow3d/analysis/loss_joint.py). Path to an
+    # edges.pt built by flow3d/analysis/build_cluster_graph.py -- normally
+    # the exact same path passed to --graph-coupling-path, so the loss only
+    # ever anchors cluster pairs the GNN's message passing already treats as
+    # connected. Loaded and cached once by Trainer, the same lazy-load-once
+    # pattern as rigidity_graph_path above; None disables the loss entirely
+    # (0.0, not even computed). Like rigidity_graph_path's
+    # "cluster_graph_file" mode, the saved cluster ids only stay valid while
+    # the cluster set doesn't change, so this is meant to be combined with
+    # --optim.no-enable-bases-control (the same requirement --enable_graph_coupling
+    # already has).
+    joint_anchor_path: str | None = None
 
 
 @dataclass
@@ -199,76 +269,33 @@ class TrainConfig:
     affinity_method: str = "agglomerative"
     affinity_n_clusters: int = 40  # only used when affinity_method == "agglomerative"
 
-    ### Graph-coupled cluster GNN (see flow3d/graph_coupling.py /
-    ### flow3d/graph_coupling_relative.py)
-    # Wraps motion_bases in a *GraphCorrectedScalableMotionBases: a GNN mixes each
-    # cluster's coarse (global) rotation/translation with its graph neighbors'
-    # and predicts a zero-init residual correction, composed onto the coarse
-    # transform (rotation via so(3) compose, translation via add). Intended to
-    # keep e.g. a hand cluster coordinated with its own forearm instead of
-    # drifting into the other hand's identity. Only the coarse transform is
-    # touched; fine (local) motion is untouched.
-    # Requires --optim.no-enable-bases-control (the cluster set -- and hence
-    # the graph topology -- must stay fixed for the whole run) and a fixed
-    # cluster graph built offline by flow3d/analysis/build_cluster_graph.py
-    # (same edges.pt format read by optim.rigidity_graph_path).
+    ### Graph-coupled cluster GNN
+    # Two implementations are supported (--gnn_variant):
+    # "relative_velocity_linear_attention" (default): a single rigid
+    #   (omega, delta_t) correction per CLUSTER (flow3d/graph_relative_linear_attention.py).
+    # "relative_edge_boundary": a small translation-only correction per EDGE
+    #   (cluster pair), applied only to boundary Gaussians and smoothly
+    #   falling off with distance from the boundary, so it can close a
+    #   seam without rotating/translating the rest of either cluster (see
+    #   flow3d/graph_relative_edge.py). Uses gnn_hidden/gnn_layers the same
+    #   way (gnn_heads is unused -- no attention heads); its falloff radius is
+    #   boundary_falloff_radius below.
+    # Both require a fixed graph and disabled bases control so cluster ids
+    # remain stable during training.
     enable_graph_coupling: bool = False
     graph_coupling_path: str | None = None
     gnn_hidden: int = 128
     gnn_layers: int = 2
-    # only used by gnn_variant in {"relative_attention",
-    # "relative_velocity_linear_attention",
-    # "relative_velocity_linear_attention_multihead"} (number of attention
-    # heads; hidden_dim must be divisible by this).
+    # hidden_dim must be divisible by the number of attention heads.
     gnn_heads: int = 4
-    # "absolute" (flow3d/graph_coupling.py, ClusterGraphGNN): message passing
-    # mean-aggregates neighbors' raw hidden features.
-    # "relative" (flow3d/graph_coupling_relative.py, RelativeClusterGraphGNN):
-    # message passing uses explicit relative motion/geometry edge features
-    # (t_j - t_i, c_j - c_i, rot6d(R_i^T @ R_j)) plus hidden-state differences.
-    # "relative_velocity_linear" (flow3d/graph_relative_velocity_linear.py,
-    # RelativeVelocityLinearClusterGraphGNN): same as "relative", plus each
-    # cluster's linear velocity (frame-to-frame coarse translation delta) is
-    # added to both the node feature (absolute v_i) and the edge feature
-    # (relative v_j - v_i), normalized by a std-based vel_scale computed once
-    # at construction time. Angular velocity/temporal-smoothness loss are not
-    # part of this variant.
-    # "relative_velocity_angular" (flow3d/graph_relative_velocity_angular.py,
-    # RelativeVelocityAngularClusterGraphGNN): same as
-    # "relative_velocity_linear" (keeps linear velocity), plus each cluster's
-    # angular velocity (frame-to-frame coarse rotation delta, as an SO(3) log
-    # via roma.rotmat_to_rotvec) is added to both the node feature (absolute
-    # ang_vel_i) and the edge feature (ang_vel_j - ang_vel_i), normalized by a
-    # separate std-based ang_vel_scale computed once at construction time.
-    # Temporal smoothness loss is not part of this variant.
-    # "relative_velocity_linear_attention" (flow3d/graph_relative_linear_attention.py,
-    # RelativeVelLinearAttentionClusterGraphGNN): same node/edge features as
-    # "relative_velocity_linear" (linear velocity only, no angular), but
-    # neighbor message aggregation is replaced with learned multi-head
-    # GAT-style attention (softmax over each receiver's in-neighbors, edge
-    # feature included in the attention score) instead of a uniform
-    # (1/in_degree) mean. gnn_heads controls the number of attention heads.
-    # "relative_velocity_linear_attention_multihead"
-    # (flow3d/graph_relative_linear_attention_multihead.py,
-    # RelativeVelLinearAttentionMultiHeadClusterGraphGNN): same as
-    # "relative_velocity_linear_attention" (same node/edge features, same
-    # attention score/softmax), but the message MLP itself is now per-head
-    # independent (each head has its own small MLP mapping
-    # [h_j - h_i, e_ij] -> head_dim) instead of one shared MLP whose output
-    # is merely reshaped into heads. gnn_heads controls the number of heads
-    # (and hence independent message MLPs).
-    # Only affects how graph-coupling messages are built; everything else
-    # (topology, hidden_dim, num_layers, output dim, loss, optimizer) is
-    # identical, so all six are a fair ablation of each other.
-    gnn_variant: Literal[
-        "absolute",
-        "relative",
-        "relative_attention",
-        "relative_velocity_linear",
-        "relative_velocity_angular",
-        "relative_velocity_linear_attention",
-        "relative_velocity_linear_attention_multihead",
-    ] = "absolute"
+    gnn_variant: Literal["relative_velocity_linear_attention", "relative_edge_boundary"] = (
+        "relative_velocity_linear_attention"
+    )
+    # "relative_edge_boundary" only: RBF radius (scene units) of the
+    # per-Gaussian falloff weight around each edge's boundary Gaussian set --
+    # exactly at the boundary set weight == 1, decaying smoothly to ~0 by a
+    # few multiples of this radius.
+    boundary_falloff_radius: float = 0.05
 
     # Training
     num_glob_epochs: int = 400

@@ -12,8 +12,9 @@ cluster_graph.build_cluster_graph, logs validation info, and writes:
     <work-dir>/analysis/cluster_graph/edges_kept.csv
     <work-dir>/analysis/cluster_graph/edges_cut.csv
     <work-dir>/analysis/cluster_graph/report.json
-    <work-dir>/analysis/cluster_graph/graph_edges.png       (unless --no-visualization)
-    <work-dir>/analysis/cluster_graph/graph_edges_2d.png    (unless --no-visualization)
+    <work-dir>/analysis/cluster_graph/graph_edges.png        (unless --no-visualization)
+    <work-dir>/analysis/cluster_graph/graph_edges_2d.png     (unless --no-visualization)
+    <work-dir>/analysis/cluster_graph/graph_edges_2d.mp4     (unless --no-visualization or --no-video)
 
 edges.pt is the format consumed by trainer.py's update_rigidity_weights and
 by the graph GNN (edge_index + per-edge stats). The PNG visualizations
@@ -39,6 +40,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+import imageio.v2 as imageio
 import numpy as np
 import torch
 import yaml
@@ -81,6 +83,31 @@ VIEWS = [
     (65, 35, "Top-front"),
     (65, 215, "Top-back"),
 ]
+
+
+def parse_pair_set(value: str) -> set[tuple[int, int]]:
+    """Parse ``3-7,7-12`` into canonical, unique cluster-id pairs."""
+    pairs: set[tuple[int, int]] = set()
+    if not value.strip():
+        return pairs
+    for item in value.split(","):
+        parts = item.strip().split("-")
+        if len(parts) != 2:
+            raise argparse.ArgumentTypeError(
+                f"Invalid pair {item!r}; expected comma-separated pairs such as '3-7,7-12'."
+            )
+        try:
+            a, b = (int(part.strip()) for part in parts)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"Invalid pair {item!r}; cluster ids must be integers."
+            ) from exc
+        if a < 0 or b < 0:
+            raise argparse.ArgumentTypeError(f"Invalid pair {item!r}; cluster ids must be >= 0.")
+        if a == b:
+            raise argparse.ArgumentTypeError(f"Invalid self-edge {item!r}; ids must differ.")
+        pairs.add((min(a, b), max(a, b)))
+    return pairs
 
 
 def _edge_linewidth(gap_summary: float, contact_distance: float, keep_multiplier: float) -> float:
@@ -354,6 +381,58 @@ def render_2d_overlay(
     return output_path
 
 
+def render_2d_overlay_video(
+    model: Any,
+    clusters: list[ClusterInfo],
+    kept_edges: list[dict],
+    cut_edges: list[dict],
+    contact_distance: float,
+    keep_multiplier: float,
+    output_path: Path,
+    fps: int = 10,
+    frame_stride: int = 1,
+) -> Path:
+    """
+    Same overlay as render_2d_overlay (rendered frame + fixed kept/cut edges
+    between cluster centers), but across every rendered frame of the
+    sequence instead of a single one, so the edges' plausibility can be
+    checked visually as the clusters move.
+    """
+    _, _, color_by_id, _ = _prepare_cluster_visual_data(clusters=clusters, max_points_per_cluster=1)
+
+    device = model.fg.params["means"].device
+    w2cs = _get_camera_w2cs(model).to(device)
+    intrinsics = model.Ks.to(device)
+    total_frames = w2cs.shape[0]
+    frame_indices = list(range(0, total_frames, max(frame_stride, 1)))
+
+    principal_x = float(intrinsics[0, 0, 2].item())
+    principal_y = float(intrinsics[0, 1, 2].item())
+    width = max(int(round(principal_x * 2.0)), 2)
+    height = max(int(round(principal_y * 2.0)), 2)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with torch.no_grad(), imageio.get_writer(output_path, fps=fps) as writer:
+        for output_index, frame_index in enumerate(frame_indices, start=1):
+            frame = _render_graph_overlay_frame(
+                model=model,
+                clusters=clusters,
+                color_by_id=color_by_id,
+                frame_index=frame_index,
+                w2c=w2cs[frame_index],
+                intrinsic=intrinsics[frame_index],
+                image_size=(width, height),
+                kept_edges=kept_edges,
+                cut_edges=cut_edges,
+                contact_distance=contact_distance,
+                keep_multiplier=keep_multiplier,
+            )
+            writer.append_data(frame)
+            print(f"[graph video {output_index:03d}/{len(frame_indices):03d}] frame={frame_index:04d}")
+
+    return output_path
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -361,6 +440,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--work-dir", "--work_dir", dest="work_dir", type=Path, required=True)
     parser.add_argument("--ckpt", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument(
+        "--force-include-pairs", type=parse_pair_set, default=set(), metavar="A-B,C-D",
+        help="Always keep these cluster pairs, e.g. '3-7,7-12'. Pairs outside the automatic candidate radius are evaluated and added as well.",
+    )
+    parser.add_argument(
+        "--force-exclude-pairs", type=parse_pair_set, default=set(), metavar="A-B,C-D",
+        help="Always cut these cluster pairs, e.g. '3-9,4-11'.",
+    )
 
     parser.add_argument("--min-cluster-size", type=int, default=20)
 
@@ -397,6 +484,16 @@ def build_parser() -> argparse.ArgumentParser:
         "pair by chance) this gate exists to catch.",
     )
     parser.add_argument("--keep-multiplier", type=float, default=1.5)
+    parser.add_argument(
+        "--gap-percentile",
+        type=float,
+        default=0.0,
+        help="0 (default): per-frame gap is the single closest boundary-point "
+        "pair (plain nearest-neighbor). >0: use that percentile (e.g. 10) of "
+        "the combined a->b/b->a nearest-neighbor distance distribution "
+        "instead -- robust to one outlier near-touching point making two "
+        "clusters look connected when their surfaces aren't broadly close.",
+    )
     parser.add_argument(
         "--gap-smoothing-window",
         type=int,
@@ -504,12 +601,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-points-per-cluster", type=int, default=2000)
     parser.add_argument("--frame-index-2d", type=int, default=0)
 
+    parser.add_argument(
+        "--no-video", action="store_true", help="Skip the 2D edge-overlay mp4 (PNGs still saved)."
+    )
+    parser.add_argument("--video-fps", type=int, default=10)
+    parser.add_argument(
+        "--video-frame-stride",
+        type=int,
+        default=1,
+        help="Render every Nth frame for the edge-overlay video (>1 speeds up "
+        "rendering for long sequences).",
+    )
+
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--overwrite", action="store_true")
     return parser
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    overlap = args.force_include_pairs & args.force_exclude_pairs
+    if overlap:
+        raise ValueError(
+            f"Pairs cannot be both force-included and force-excluded: {sorted(overlap)}"
+        )
     if args.min_cluster_size < 1:
         raise ValueError("--min-cluster-size must be >= 1")
     if args.contact_spacing_multiplier <= 0:
@@ -522,6 +636,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--center-gate-max-median-p10-ratio must be > 0")
     if args.keep_multiplier <= 0:
         raise ValueError("--keep-multiplier must be > 0")
+    if not 0 <= args.gap_percentile <= 100:
+        raise ValueError("--gap-percentile must be in [0, 100]")
     if args.gap_smoothing_window < 1:
         raise ValueError("--gap-smoothing-window must be >= 1")
     if not 0 <= args.gap_confidence_threshold <= 1:
@@ -534,6 +650,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--boundary-min-gaussians must be >= 1")
     if args.boundary_max_gaussians < args.boundary_min_gaussians:
         raise ValueError("--boundary-max-gaussians must be >= --boundary-min-gaussians")
+    if args.video_fps < 1:
+        raise ValueError("--video-fps must be >= 1")
+    if args.video_frame_stride < 1:
+        raise ValueError("--video-frame-stride must be >= 1")
 
 
 def load_model_and_clusters(
@@ -989,6 +1109,7 @@ def main() -> None:
         candidate_radius_multiplier=args.candidate_radius_multiplier,
         center_gate_max_median_to_p10_ratio=args.center_gate_max_median_p10_ratio,
         keep_multiplier=args.keep_multiplier,
+        gap_percentile=args.gap_percentile,
         gap_smoothing_window=args.gap_smoothing_window,
         gap_confidence_threshold=args.gap_confidence_threshold,
         boundary_fraction=args.boundary_fraction,
@@ -1009,6 +1130,8 @@ def main() -> None:
         contact_distance=contact_distance,
         config=config,
         confidences_all_frames=confidences_all_frames,
+        force_include_pairs=args.force_include_pairs,
+        force_exclude_pairs=args.force_exclude_pairs,
     )
 
     print()
@@ -1055,6 +1178,8 @@ def main() -> None:
             "cut_edge_count": len(edges_cut_dicts),
             "valid_cluster_ids": valid_ids,
             "filtered_cluster_ids": filtered_ids,
+            "force_include_pairs": [list(pair) for pair in sorted(args.force_include_pairs)],
+            "force_exclude_pairs": [list(pair) for pair in sorted(args.force_exclude_pairs)],
             "config": {**asdict(config), "min_cluster_size": args.min_cluster_size},
         },
     }
@@ -1102,6 +1227,21 @@ def main() -> None:
         )
         visualization_files.append(str(path_2d))
         print(f"[visualization] saved 2D overlay: {path_2d}")
+
+        if not args.no_video:
+            path_video = render_2d_overlay_video(
+                model=model,
+                clusters=clusters,
+                kept_edges=edges_kept_dicts,
+                cut_edges=edges_cut_dicts,
+                contact_distance=result.contact_distance,
+                keep_multiplier=config.keep_multiplier,
+                output_path=output_dir / "graph_edges_2d.mp4",
+                fps=args.video_fps,
+                frame_stride=args.video_frame_stride,
+            )
+            visualization_files.append(str(path_video))
+            print(f"[visualization] saved 2D overlay video: {path_video}")
 
     print()
     print("=" * 72)
