@@ -134,8 +134,46 @@ class LossesConfig:
     # own parameters (base coarse/fine motion is a frozen input), so this loss
     # can only close the gap via the small localized correction, not by moving
     # (and thereby distorting) the rest of either cluster.
-    w_boundary_gap: float = 0.1
+    #
+    # Default 0.0: OFF. The correction magnitude itself is no longer gated by
+    # this hinge (see graph_relative_edge.py's EdgeBoundaryGNN docstring) --
+    # contact_reference_distance is a median over this SAME reconstruction's
+    # own "connected" frames, so an edge with a persistent (roughly constant)
+    # misalignment has contact_reference_distance already absorb that gap as
+    # "normal", making the old gap_error-gated correction permanently 0 there
+    # even though the underlying gap is real. Set > 0 explicitly to opt back
+    # into this hinge as an ADDITIONAL loss on top of the render-loss-driven
+    # correction (kept for backward CLI/config compatibility and as a
+    # diagnostic/opt-in knob, not removed).
+    w_boundary_gap: float = 0.0
     boundary_gap_tolerance: float = 0.01
+
+    ### Edge-PATCH correction (omega + delta_t per edge-SIDE) regularizers --
+    # see flow3d/graph_relative_linear_attention_boundary.py. Only active
+    # when motion_bases is
+    # RelativeVelLinearAttentionBoundaryGraphCorrectedScalableMotionBases
+    # (--gnn_variant=relative_velocity_linear_attention_boundary), no-op
+    # (0.0, not even computed) otherwise. Applied to the RAW (patch-weight-
+    # before-application) edge decoder output, same target as
+    # w_gnn_correction_reg/w_gnn_correction_smooth for the per-cluster
+    # variant. Both 0.0 while the edge decoder head is still zero-initialized.
+    w_edge_correction_reg: float = 0.01
+    w_edge_correction_smooth: float = 0.01
+
+    ### Edge-patch boundary gap loss -- see flow3d/graph_relative_linear_
+    # attention_boundary.py's compute_edge_patch_gap_loss. Only active
+    # (nonzero) when motion_bases is
+    # RelativeVelLinearAttentionBoundaryGraphCorrectedScalableMotionBases.
+    # Only applied to edges that class already judged reliable
+    # (persistence/num_known_frames gated at construction, not every
+    # CONNECTED edge) and observed CONNECTED this frame. Gradient reaches
+    # only the edge decoder GNN's own parameters (base motion is a frozen,
+    # detached input), so this loss can only close the gap via the small
+    # localized correction. Default 0.0: OFF, same rationale as
+    # w_boundary_gap above (opt-in additional pressure on top of the
+    # render-loss-driven correction).
+    w_edge_boundary_gap: float = 0.0
+    edge_boundary_gap_tolerance: float = 0.01
 
     ### Joint anchor loss -- see flow3d/analysis/loss_joint.py. Only active when
     # optim_cfg.joint_anchor_path is set (an edges.pt built by
@@ -270,9 +308,21 @@ class TrainConfig:
     affinity_n_clusters: int = 40  # only used when affinity_method == "agglomerative"
 
     ### Graph-coupled cluster GNN
-    # Two implementations are supported (--gnn_variant):
+    # Four implementations are supported (--gnn_variant):
     # "relative_velocity_linear_attention" (default): a single rigid
     #   (omega, delta_t) correction per CLUSTER (flow3d/graph_relative_linear_attention.py).
+    # "relative_velocity_linear_attention_frame": same per-CLUSTER (omega,
+    #   delta_t) correction and multi-head attention as the variant above,
+    #   but attention (and the final correction) is gated by each edge's
+    #   per-frame CONNECTED/DISCONNECTED/UNKNOWN state, read from
+    #   graph_coupling_path's connected_frame_indices/unknown_frame_indices
+    #   (see flow3d/graph_relative_linear_attention_frame.py). A cluster's
+    #   correction is scaled by the max gate over its incident edges, so one
+    #   CONNECTED incident edge is enough to turn the whole cluster's
+    #   correction on even if another incident edge is DISCONNECTED (this is
+    #   the defined behavior of this variant, not a bug -- see that module's
+    #   docstring). Uses gnn_hidden/gnn_layers/gnn_heads the same way as
+    #   "relative_velocity_linear_attention".
     # "relative_edge_boundary": a small translation-only correction per EDGE
     #   (cluster pair), applied only to boundary Gaussians and smoothly
     #   falling off with distance from the boundary, so it can close a
@@ -280,22 +330,85 @@ class TrainConfig:
     #   flow3d/graph_relative_edge.py). Uses gnn_hidden/gnn_layers the same
     #   way (gnn_heads is unused -- no attention heads); its falloff radius is
     #   boundary_falloff_radius below.
-    # Both require a fixed graph and disabled bases control so cluster ids
-    # remain stable during training.
+    # "relative_velocity_linear_attention_boundary": the SAME node encoder/
+    #   relative edge feature/multi-head attention message passing as
+    #   "relative_velocity_linear_attention" (cluster embeddings are still
+    #   contextual over the whole graph), but the readout is a per-EDGE,
+    #   per-SIDE decoder instead of a per-cluster 6D head: each kept edge
+    #   (a, b) gets its OWN (omega, delta_t) for side a and side b, applied
+    #   only to that side's boundary-patch Gaussians (read from
+    #   boundary_patch_path, a boundary_patch.pt built by flow3d/analysis/
+    #   build_cluster_graph_mesh.py) and pivoted at that patch's own current
+    #   centroid -- NOT the cluster center (see
+    #   flow3d/graph_relative_linear_attention_boundary.py). A cluster
+    #   touching several edges (e.g. 19-12, 19-8, 19-24) gets an
+    #   independent correction per edge; a Gaussian in more than one edge's
+    #   patch gets a weighted combination (never a naive sum). Interior
+    #   (non-boundary) Gaussians are therefore byte-identical to the
+    #   uncorrected MotionScale baseline no matter what the GNN predicts.
+    #   Uses gnn_hidden/gnn_layers/gnn_heads the same way as
+    #   "relative_velocity_linear_attention". edge topology and per-edge
+    #   gate/reference-distance/persistence are read directly from
+    #   graph_coupling_path's edges.pt (not from a separately-built
+    #   edge_index) -- boundary_patch_path only supplies patch Gaussians/
+    #   weights, matched to edges.pt's kept edges by cluster pair.
+    # All four require a fixed graph and disabled bases control so cluster
+    # ids remain stable during training.
     enable_graph_coupling: bool = False
     graph_coupling_path: str | None = None
     gnn_hidden: int = 128
     gnn_layers: int = 2
     # hidden_dim must be divisible by the number of attention heads.
     gnn_heads: int = 4
-    gnn_variant: Literal["relative_velocity_linear_attention", "relative_edge_boundary"] = (
-        "relative_velocity_linear_attention"
-    )
+    gnn_variant: Literal[
+        "relative_velocity_linear_attention",
+        "relative_velocity_linear_attention_frame",
+        "relative_edge_boundary",
+        "relative_velocity_linear_attention_boundary",
+    ] = "relative_velocity_linear_attention"
     # "relative_edge_boundary" only: RBF radius (scene units) of the
     # per-Gaussian falloff weight around each edge's boundary Gaussian set --
     # exactly at the boundary set weight == 1, decaying smoothly to ~0 by a
     # few multiples of this radius.
+    #
+    # "relative_velocity_linear_attention_boundary" reuses this same field as
+    # its Gaussian<->canonical-boundary-reference snap radius fallback
+    # (assign_edge_memberships's snap_radius, only used for a reference point
+    # whose own local_scale is <= 0 -- normally that per-point local_scale is
+    # used instead, density-adaptive).
     boundary_falloff_radius: float = 0.05
+    # "relative_edge_boundary" only: multiplier on each edge's boundary patch's
+    # own local Gaussian spacing (patch_ref_local_scale) to get that edge's
+    # max_displacement -- the absolute cap on |correction| per step (see
+    # flow3d/graph_relative_edge.py's _compute_edge_max_displacement). Larger
+    # allows bigger single-step pulls; since correction is learned directly
+    # from the render loss (no gap_error cap any more), this is the main
+    # safety valve against an overly large single-step correction.
+    #
+    # "relative_velocity_linear_attention_boundary" reuses this same field as
+    # its per-edge translation clamp scale (same _compute_edge_max_displacement
+    # design, see flow3d/graph_relative_linear_attention_boundary.py).
+    correction_max_disp_scale: float = 2.0
+    # "relative_velocity_linear_attention_boundary" only: absolute cap
+    # (radians) on the edge decoder's rotation correction (see
+    # flow3d/graph_relative_linear_attention_boundary.py's
+    # _clamp_vector_magnitude) -- unlike the translation cap, this isn't
+    # derived from patch local_scale (rotation has no natural length scale),
+    # so it's its own fixed hyperparameter.
+    edge_correction_max_omega: float = 0.2
+    # "relative_velocity_linear_attention_boundary" only: an edge must have at
+    # least this much persistence AND this many known frames (both read from
+    # graph_coupling_path's edges.pt) to be included in the edge-patch
+    # boundary gap loss (w_edge_boundary_gap) -- a sparsely- or unreliably-
+    # observed edge's distance measurements shouldn't be trusted as a gap-loss
+    # target even if it happens to be CONNECTED this frame.
+    edge_gap_loss_min_persistence: float = 0.5
+    edge_gap_loss_min_known_frames: int = 1
+    # "relative_velocity_linear_attention_boundary" only: path to the
+    # boundary_patch.pt built by flow3d/analysis/build_cluster_graph_mesh.py
+    # (typically <work_dir>/analysis/cluster_graph_mesh/boundary_patch.pt).
+    # Required when gnn_variant is this value; unused otherwise.
+    boundary_patch_path: str | None = None
 
     # Training
     num_glob_epochs: int = 400

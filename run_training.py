@@ -68,6 +68,13 @@ def _graph_corrected_bases_cls(gnn_variant: str):
 
         return RelativeVelLinearAttentionGraphCorrectedScalableMotionBases
 
+    if gnn_variant == "relative_velocity_linear_attention_frame":
+        from flow3d.graph_relative_linear_attention_frame import (
+            RelativeVelLinearAttentionFrameGraphCorrectedScalableMotionBases,
+        )
+
+        return RelativeVelLinearAttentionFrameGraphCorrectedScalableMotionBases
+
     if gnn_variant == "relative_edge_boundary":
         from flow3d.graph_relative_edge import (
             EdgeBoundaryGraphCorrectedScalableMotionBases,
@@ -75,26 +82,72 @@ def _graph_corrected_bases_cls(gnn_variant: str):
 
         return EdgeBoundaryGraphCorrectedScalableMotionBases
 
+    if gnn_variant == "relative_velocity_linear_attention_boundary":
+        from flow3d.graph_relative_linear_attention_boundary import (
+            RelativeVelLinearAttentionBoundaryGraphCorrectedScalableMotionBases,
+        )
+
+        return RelativeVelLinearAttentionBoundaryGraphCorrectedScalableMotionBases
+
     raise ValueError(
         f"Unsupported gnn_variant: {gnn_variant!r}; expected "
-        "'relative_velocity_linear_attention' or 'relative_edge_boundary'"
+        "'relative_velocity_linear_attention', "
+        "'relative_velocity_linear_attention_frame', 'relative_edge_boundary', or "
+        "'relative_velocity_linear_attention_boundary'"
     )
 
 
-def _graph_bases_extra_kwargs(cfg: TrainConfig, canonical_means: torch.Tensor, cluster_ids_all: torch.Tensor) -> dict:
+def _graph_bases_extra_kwargs(
+    cfg: TrainConfig,
+    canonical_means: torch.Tensor,
+    cluster_ids_all: torch.Tensor,
+    coefs_all: torch.Tensor,
+    total_num_frames: int,
+) -> dict:
     """Arguments specific to the selected gnn_variant's from_scalable_motion_bases.
 
     :param canonical_means: (G, 3) canonical foreground Gaussian means (e.g.
         fg_params.params["means"].detach() or model.fg.params["means"].detach()).
     :param cluster_ids_all: (G,) canonical foreground Gaussian cluster ids,
         same order as canonical_means.
+    :param coefs_all: (G, F) canonical foreground Gaussian fine-basis blend
+        weights, same order (e.g. fg_params.get_coefs().detach() or
+        model.fg.get_coefs().detach()) -- "relative_edge_boundary" only, used
+        to snapshot each boundary-adjacent Gaussian's actual (coarse+fine
+        blended) position (flow3d/graph_relative_edge.py's
+        EdgeBoundaryGraphCorrectedScalableMotionBases._falloff_side_means).
     """
     if cfg.gnn_variant == "relative_edge_boundary":
         return {
             "edges_path": cfg.graph_coupling_path,
             "canonical_means": canonical_means,
             "cluster_ids_all": cluster_ids_all,
+            "coefs_all": coefs_all,
             "falloff_radius": cfg.boundary_falloff_radius,
+            "gap_tolerance": cfg.loss.boundary_gap_tolerance,
+            "correction_max_disp_scale": cfg.correction_max_disp_scale,
+        }
+    if cfg.gnn_variant == "relative_velocity_linear_attention_frame":
+        return {"gnn_num_heads": cfg.gnn_heads, "edges_path": cfg.graph_coupling_path}
+    if cfg.gnn_variant == "relative_velocity_linear_attention_boundary":
+        assert cfg.boundary_patch_path, (
+            "gnn_variant='relative_velocity_linear_attention_boundary' requires "
+            "--boundary_patch_path to point to a boundary_patch.pt built by "
+            "flow3d/analysis/build_cluster_graph_mesh.py."
+        )
+        return {
+            "gnn_num_heads": cfg.gnn_heads,
+            "edges_path": cfg.graph_coupling_path,
+            "boundary_patch_path": cfg.boundary_patch_path,
+            "canonical_means": canonical_means,
+            "cluster_ids_all": cluster_ids_all,
+            "coefs_all": coefs_all,
+            "snap_radius": cfg.boundary_falloff_radius,
+            "max_omega": cfg.edge_correction_max_omega,
+            "max_disp_scale": cfg.correction_max_disp_scale,
+            "gap_loss_min_persistence": cfg.edge_gap_loss_min_persistence,
+            "gap_loss_min_known_frames": cfg.edge_gap_loss_min_known_frames,
+            "total_num_frames": total_num_frames,
         }
     return {"gnn_num_heads": cfg.gnn_heads}
 
@@ -240,6 +293,12 @@ def main():
         + [(glob_start_epoch, glob_start_epoch + cfg.reset_opacity_epochs)]
     )
 
+    # Restore RNG state (if resuming from a checkpoint) now that model,
+    # trainer, and the DataLoader/samplers are fully constructed -- doing it
+    # any earlier would have their own RNG draws (e.g. init noise) consume
+    # from the restored stream instead of the training loop's own draws.
+    trainer.restore_pending_rng_state()
+
     # Training steps
     for epoch in (pbar := tqdm(range(start_epoch, num_epochs), initial=start_epoch, total=num_epochs)):
         trainer.set_epoch(epoch)
@@ -250,12 +309,6 @@ def main():
             batch = to_device(batch, device)
             loss = trainer.train_step(batch)
             pbar.set_description(f"Training [{start}, {end}): loss: {loss:.6f}")
-
-        # save checkpoints
-        if (epoch + 1) % cfg.optim.checkpoint_every_steps == 0:
-            trainer.save_checkpoint(f"{cfg.work_dir}/checkpoints/last.ckpt")
-        if cfg.save_more_ckpts and ((epoch + 1) % cfg.save_videos_every == 0):
-            trainer.save_checkpoint(f"{cfg.work_dir}/checkpoints/epoch_{epoch:04d}.ckpt")
 
         if validator is not None:
             if (epoch + 1) % cfg.save_videos_every == 0:
@@ -300,6 +353,15 @@ def main():
             train_loader.batch_sampler.set_ranges([(0, end, 0, end)])
             train_loader.batch_sampler.set_num_batches(int(np.ceil(end / cfg.batch_size)))
 
+        # save checkpoints -- only after this epoch's training, control_step,
+        # and propagation update have all finished, and tagged with
+        # resume_epoch=epoch+1 (the next epoch to run), so a resumed run
+        # never redoes any part of this epoch.
+        if (epoch + 1) % cfg.optim.checkpoint_every_steps == 0:
+            trainer.save_checkpoint(f"{cfg.work_dir}/checkpoints/last.ckpt", resume_epoch=epoch + 1)
+        if cfg.save_more_ckpts and ((epoch + 1) % cfg.save_videos_every == 0):
+            trainer.save_checkpoint(f"{cfg.work_dir}/checkpoints/epoch_{epoch:04d}.ckpt", resume_epoch=epoch + 1)
+
     ## Finish Training
     # Log final results
     hparam_dict = {
@@ -334,7 +396,7 @@ def initialize_and_checkpoint_model(
     """
     if os.path.exists(ckpt_path):
         if cfg.enable_graph_coupling:
-            wrapped_path = _wrap_checkpoint_with_graph_coupling(cfg, ckpt_path)
+            wrapped_path = _wrap_checkpoint_with_graph_coupling(cfg, ckpt_path, train_dataset.num_frames)
             if wrapped_path is not None:
                 return wrapped_path
         guru.info(f"model checkpoint exists at {ckpt_path}")
@@ -399,6 +461,8 @@ def initialize_and_checkpoint_model(
                 cfg,
                 fg_params.params["means"].detach(),
                 fg_params.get_cluster_ids().reshape(-1).long(),
+                fg_params.get_coefs().detach(),
+                train_dataset.num_frames,
             ),
         ).to(device)
         guru.info(
@@ -418,7 +482,9 @@ def initialize_and_checkpoint_model(
     return ckpt_path
 
 
-def _wrap_checkpoint_with_graph_coupling(cfg: TrainConfig, source_ckpt_path: str) -> str | None:
+def _wrap_checkpoint_with_graph_coupling(
+    cfg: TrainConfig, source_ckpt_path: str, total_num_frames: int
+) -> str | None:
     """
     Resume support for --enable_graph_coupling starting from a checkpoint
     trained WITHOUT it (plain ScalableMotionBases motion_bases -- e.g. a
@@ -429,6 +495,17 @@ def _wrap_checkpoint_with_graph_coupling(cfg: TrainConfig, source_ckpt_path: str
     untouched (it may be an external run's checkpoint that other work still
     depends on).
 
+    Also covers a second resume case for gnn_variant=
+    "relative_velocity_linear_attention_boundary": if source_ckpt_path is
+    already graph-coupled but its correction_gate/connected_mask were baked
+    with a shorter time axis than total_num_frames (attached while
+    bases.num_frames was still just --num_init_frames, before later frame
+    propagation grew rots/fine_rots further), regenerate those two buffers
+    from cfg.graph_coupling_path so ts beyond the original window no longer
+    indexes out of bounds -- see
+    RelativeVelLinearAttentionBoundaryGraphCorrectedScalableMotionBases.
+    regenerate_stale_gate_state_dict.
+
     The wrap is exactly GraphBasesCls.from_scalable_motion_bases: coarse/fine
     motion params are copied as-is and only the GNN correction is added,
     zero-initialized (both ClusterGraphGNN and RelativeClusterGraphGNN zero
@@ -436,17 +513,21 @@ def _wrap_checkpoint_with_graph_coupling(cfg: TrainConfig, source_ckpt_path: str
     -- identical outputs to the source checkpoint until gradients move the
     GNN off zero.
 
-    Optimizer/scheduler state from source_ckpt_path is intentionally dropped:
-    it has no entries for the new motion_bases.gnn.* params, and
-    Trainer.load_checkpoint_optimizers indexes every one of the resumed
-    model's param groups into that dict, so keeping it would KeyError on
-    those params. Dropping it means ALL params (not just the GNN's) get a
-    fresh Adam optimizer on resume -- epoch/global_step are preserved from
-    source_ckpt_path so the epoch-based propagation schedule and checkpoint
-    cadence still continue from where it left off.
+    Optimizer/scheduler/trainer state (running_stats, rigidity cache, RNG) is
+    carried over from source_ckpt_path, not dropped: Trainer.
+    load_checkpoint_optimizers/load_checkpoint_schedulers now tolerate
+    missing keys, so the only params that get a fresh Adam optimizer are the
+    new motion_bases.gnn.* ones this wrap just added -- every param that
+    already existed in source_ckpt_path (fg/bg/shad, coarse/fine motion
+    bases, camera poses) keeps its exact optimizer/scheduler state. epoch/
+    global_step are likewise preserved as-is, so this is a true exact-resume
+    splice: training continues from source_ckpt_path's precise state, with
+    the GNN correction bolted on as a zero-initialized no-op.
 
-    :return: path to the wrapped checkpoint, or None if source_ckpt_path is
-        already graph-coupled (has "motion_bases.gnn." keys) -- nothing to do,
+    :return: path to the wrapped (or gate-regenerated) checkpoint, or None if
+        source_ckpt_path is already graph-coupled (has "motion_bases.gnn."
+        keys) and -- for the boundary variant -- its correction_gate/
+        connected_mask already match total_num_frames: nothing to do,
         SceneModel.init_from_state_dict already restores it correctly as-is.
     """
     assert cfg.graph_coupling_path, (
@@ -462,7 +543,37 @@ def _wrap_checkpoint_with_graph_coupling(cfg: TrainConfig, source_ckpt_path: str
     ckpt = torch.load(source_ckpt_path, map_location="cpu", weights_only=False)
     state_dict = ckpt["model"]
     if any("motion_bases.gnn." in k for k in state_dict):
-        return None
+        if cfg.gnn_variant != "relative_velocity_linear_attention_boundary":
+            return None
+
+        from flow3d.graph_relative_linear_attention_boundary import (
+            RelativeVelLinearAttentionBoundaryGraphCorrectedScalableMotionBases,
+        )
+
+        updated = RelativeVelLinearAttentionBoundaryGraphCorrectedScalableMotionBases.regenerate_stale_gate_state_dict(
+            state_dict,
+            cfg.graph_coupling_path,
+            total_num_frames,
+            cfg.edge_gap_loss_min_persistence,
+            cfg.edge_gap_loss_min_known_frames,
+        )
+        if updated is None:
+            return None
+
+        guru.info(
+            f"Resume: {source_ckpt_path}'s correction_gate/connected_mask were "
+            f"baked with a shorter time axis than total_num_frames={total_num_frames} "
+            "(attached before later frame propagation) -- regenerating both from "
+            f"{cfg.graph_coupling_path} and saving to cfg.work_dir's own "
+            "checkpoints/last.ckpt (everything else, including optimizer/scheduler "
+            "state, left untouched)."
+        )
+        new_state_dict = dict(state_dict)
+        new_state_dict.update(updated)
+        target_ckpt_path = os.path.join(cfg.work_dir, "checkpoints/last.ckpt")
+        os.makedirs(os.path.dirname(target_ckpt_path), exist_ok=True)
+        torch.save({**ckpt, "model": new_state_dict}, target_ckpt_path)
+        return target_ckpt_path
 
     from flow3d.graph_coupling import build_edge_index_from_edges_pt
     from flow3d.params import ScalableMotionBases
@@ -484,6 +595,8 @@ def _wrap_checkpoint_with_graph_coupling(cfg: TrainConfig, source_ckpt_path: str
             cfg,
             model.fg.params["means"].detach(),
             model.fg.get_cluster_ids().reshape(-1).long(),
+            model.fg.get_coefs().detach(),
+            total_num_frames,
         ),
     )
 
@@ -495,14 +608,18 @@ def _wrap_checkpoint_with_graph_coupling(cfg: TrainConfig, source_ckpt_path: str
         f"edges={edge_index.shape[1]}, from "
         f"{cfg.graph_coupling_path}; correction zero-initialized) and saving "
         f"to {target_ckpt_path} (source left untouched, epoch="
-        f"{ckpt.get('epoch', 0)}, global_step={ckpt.get('global_step', 0)} "
-        f"preserved, optimizer/scheduler state dropped -- fresh optimizer "
-        f"for all params)."
+        f"{ckpt.get('epoch', 0)}, global_step={ckpt.get('global_step', 0)}, "
+        f"optimizer/scheduler/control_state/rng_state all carried over -- "
+        f"only the new GNN params get a fresh optimizer)."
     )
     os.makedirs(os.path.dirname(target_ckpt_path), exist_ok=True)
     torch.save(
         {
             "model": model.state_dict(),
+            "optimizers": ckpt.get("optimizers", {}),
+            "schedulers": ckpt.get("schedulers", {}),
+            "control_state": ckpt.get("control_state"),
+            "rng_state": ckpt.get("rng_state"),
             "epoch": ckpt.get("epoch", 0),
             "global_step": ckpt.get("global_step", 0),
         },

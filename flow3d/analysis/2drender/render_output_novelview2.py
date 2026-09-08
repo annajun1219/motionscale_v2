@@ -18,8 +18,8 @@ Instead, this script:
      viewpoint to evaluate novel views against.
   2. Orbits that single fixed camera around the foreground centroid (computed
      once, at --ref_frame) by every (yaw, pitch) combination in the requested
-     grid -- default yaw in {-20,-10,0,10,20} deg, pitch in {-10,0,10} deg,
-     i.e. 15 novel camera poses total. Each novel pose keeps the same
+     grid -- default yaw in {-30,-25,-20,-10,0,10,20,25,30} deg, pitch in
+     {-15,-10,0,10,15} deg, i.e. 45 novel camera poses total. Each novel pose keeps the same
      distance to the pivot as the reference camera (mega-sam's scale is
      arbitrary, but preserving distance keeps foreshortening comparable) and
      reuses the reference camera's own up direction, so yaw=0/pitch=0
@@ -82,10 +82,12 @@ def build_parser() -> argparse.ArgumentParser:
              "novel views orbit around. Default: the middle training frame.",
     )
     parser.add_argument(
-        "--yaw-deg", "--yaw_deg", dest="yaw_deg", type=str, default="-20,-10,0,10,20",
+        "--yaw-deg", "--yaw_deg", dest="yaw_deg", type=str,
+        default="-30,-25,-20,-10,0,10,20,25,30",
     )
     parser.add_argument(
-        "--pitch-deg", "--pitch_deg", dest="pitch_deg", type=str, default="-10,0,10",
+        "--pitch-deg", "--pitch_deg", dest="pitch_deg", type=str,
+        default="-15,-10,0,10,15",
     )
     parser.add_argument(
         "--orbit-radius-scale", "--orbit_radius_scale", dest="orbit_radius_scale",

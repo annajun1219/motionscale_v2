@@ -120,6 +120,7 @@ def gnn_correction_edge_consistency_loss(
     weight_rot: float = 1.0,
     weight_transl: float = 1.0,
     cos_margin: float = 0.5,
+    edge_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Weak edge-consistency loss: penalizes connected clusters' corrections
@@ -138,6 +139,18 @@ def gnn_correction_edge_consistency_loss(
     :param cos_margin: only pairs with cosine similarity below -cos_margin
         incur loss. cos_margin=0.5 means only genuinely opposing (more than
         ~120 degrees apart) corrections are penalized.
+    :param edge_weight: (E, B) or None. None (default -- every variant other
+        than flow3d/graph_relative_linear_attention_frame.py takes this path)
+        reproduces the previous behavior exactly: every edge weighted
+        equally, plain mean. When given (E, B) -- e.g. the frame variant's
+        `motion_bases.last_correction["edge_gate_dir"]`, this batch's
+        per-directed-edge CONNECTED/DISCONNECTED/UNKNOWN gate -- each edge's
+        (squared) hinge term is weighted by it and the result is normalized
+        by `sum(edge_weight)` (a weighted mean, NOT a count of "active"
+        edges): a DISCONNECTED edge (weight exactly 0) contributes exactly 0
+        to both the numerator and denominator, and an UNKNOWN edge with e.g.
+        weight 0.3 contributes exactly 0.3x to both -- a continuous weighting,
+        not a hard include/exclude split.
     :return: scalar; exactly 0.0 (no graph edges) if edge_index_dir is empty.
     """
     if edge_index_dir.numel() == 0:
@@ -151,10 +164,15 @@ def gnn_correction_edge_consistency_loss(
     hinge_omega = F.relu(-cos_omega - cos_margin)
     hinge_delta_t = F.relu(-cos_delta_t - cos_margin)
 
-    return (
-        weight_rot * hinge_omega.pow(2).mean()
-        + weight_transl * hinge_delta_t.pow(2).mean()
-    )
+    if edge_weight is None:
+        rot_term = hinge_omega.pow(2).mean()
+        transl_term = hinge_delta_t.pow(2).mean()
+    else:
+        denom = edge_weight.sum().clamp_min(1e-6)
+        rot_term = (hinge_omega.pow(2) * edge_weight).sum() / denom
+        transl_term = (hinge_delta_t.pow(2) * edge_weight).sum() / denom
+
+    return weight_rot * rot_term + weight_transl * transl_term
 
 
 if __name__ == "__main__":
@@ -225,5 +243,41 @@ if __name__ == "__main__":
     edge_empty = gnn_correction_edge_consistency_loss(opposing, opposing, empty_edges)
     print(f"[edge-consistency] empty graph = {edge_empty.item():.3e}")
     assert edge_empty.item() == 0.0
+
+    # --- 5. edge_weight (frame-variant gate weighting): backward-compatible
+    #     default, all-zero excludes everything, and a partial (0/1) mask
+    #     reproduces the plain mean restricted to the weight==1 subset exactly
+    #     (since sum(hinge^2 * weight) / sum(weight) collapses to that subset's
+    #     mean when weight is binary).
+    E = edge_index_dir.shape[1]
+    edge_weight_ones = torch.ones(E, B)
+    edge_opp_weight_ones = gnn_correction_edge_consistency_loss(
+        opposing, opposing, edge_index_dir, edge_weight=edge_weight_ones
+    )
+    print(f"[edge-consistency gate] weight=1 everywhere == unweighted: {edge_opp_weight_ones.item():.3e} vs {edge_opp.item():.3e}")
+    assert abs(edge_opp_weight_ones.item() - edge_opp.item()) < 1e-6
+
+    edge_weight_zeros = torch.zeros(E, B)
+    edge_opp_weight_zeros = gnn_correction_edge_consistency_loss(
+        opposing, opposing, edge_index_dir, edge_weight=edge_weight_zeros
+    )
+    print(f"[edge-consistency gate] weight=0 everywhere -> loss = {edge_opp_weight_zeros.item():.3e} (expect 0)")
+    assert edge_opp_weight_zeros.item() == 0.0
+
+    edge_weight_partial = torch.zeros(E, B)
+    edge_weight_partial[0] = 1.0  # only the first (opposing) edge contributes
+    edge_opp_weight_partial = gnn_correction_edge_consistency_loss(
+        opposing, opposing, edge_index_dir, edge_weight=edge_weight_partial, cos_margin=0.5
+    )
+    src0, dst0 = edge_index_dir[0, 0], edge_index_dir[1, 0]
+    cos0 = F.cosine_similarity(opposing[src0], opposing[dst0], dim=-1)
+    # omega and delta_t are both `opposing` here, so the rot and transl terms
+    # are identical and both count (weight_rot=weight_transl=1.0 default).
+    expected_partial = 2.0 * F.relu(-cos0 - 0.5).pow(2).mean().item()
+    print(
+        f"[edge-consistency gate] weight on edge 0 only -> loss = "
+        f"{edge_opp_weight_partial.item():.3e} vs expected {expected_partial:.3e}"
+    )
+    assert abs(edge_opp_weight_partial.item() - expected_partial) < 1e-6
 
     print("OK")

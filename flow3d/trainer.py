@@ -1,4 +1,5 @@
 import functools
+import random
 import time
 from dataclasses import asdict
 from typing import cast
@@ -41,6 +42,10 @@ from flow3d.graph_relative_edge import (
     boundary_magnitude_smoothness_loss,
     compute_boundary_gap_loss,
 )
+from flow3d.graph_relative_linear_attention_boundary import (
+    RelativeVelLinearAttentionBoundaryGraphCorrectedScalableMotionBases,
+    compute_edge_patch_gap_loss,
+)
 from flow3d.data.utils import compute_depth_normal_mask, to_device
 from flow3d.metrics import PCK, mLPIPS, mPSNR, mSSIM
 from flow3d.scene_model import SceneModel
@@ -49,6 +54,35 @@ from flow3d.vis.viewer import DynamicViewer
 from flow3d.init_utils import cluster_by_velocities, init_motion_params_for_split
 from flow3d.rigidity_graph import build_body_connectivity_graph, log_connectivity_graph
 from sklearn.cluster import AgglomerativeClustering
+
+
+def capture_rng_state() -> dict:
+    """
+    Snapshot every RNG stream that training-loop randomness (e.g. the
+    per-batch frame sampling in CustomBatchSampler.__iter__, which draws from
+    np.random) can come from, so an exact resume replays the same sequence of
+    random draws as an uninterrupted run.
+    """
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state: dict | None) -> None:
+    """Inverse of capture_rng_state(). No-op if state is None/empty (e.g. a
+    checkpoint saved before this field existed, or a fresh from-scratch init)."""
+    if not state:
+        return
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    if "torch_cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
 
 
 class Trainer:
@@ -111,6 +145,13 @@ class Trainer:
         self.global_step = 0
         self.epoch = 0
         self.pose_optimize_intervals: list[tuple[int, int]] = []  # [(start, end), ...], empty = never optimize
+        # RNG state loaded from a checkpoint (see init_from_checkpoint), held
+        # here until restore_pending_rng_state() is called. Deliberately not
+        # applied immediately: model/trainer/DataLoader construction itself
+        # consumes RNG draws (e.g. weight init for any freshly-added params),
+        # so applying it too early would perturb those instead of just the
+        # training loop's own draws.
+        self.pending_rng_state: dict | None = None
 
         self.viewer = None
         if port is not None:
@@ -151,7 +192,18 @@ class Trainer:
         optimize = any(start <= self.epoch < end for start, end in self.pose_optimize_intervals)
         self.set_pose_grad(optimize)
 
-    def save_checkpoint(self, path: str):
+    def save_checkpoint(self, path: str, resume_epoch: int | None = None):
+        """
+        :param resume_epoch: the epoch a resumed run should start at (i.e.
+            the *next* epoch to train, not the one just finished). Callers
+            that save mid-epoch (e.g. a legacy/manual snapshot) can omit this
+            to fall back to self.epoch; run_training.py's main loop always
+            passes epoch+1, since it only calls this after that epoch's
+            training, control_step, and propagation update have all
+            completed -- so a resumed run starts clean at the next epoch
+            instead of redoing (part of) this one.
+        """
+        epoch_to_save = self.epoch if resume_epoch is None else resume_epoch
         model_dict = self.model.state_dict()
         optimizer_dict = {k: v.state_dict() for k, v in self.optimizers.items()}
         scheduler_dict = {k: v.state_dict() for k, v in self.scheduler.items()}
@@ -160,11 +212,66 @@ class Trainer:
             "optimizers": optimizer_dict,
             "schedulers": scheduler_dict,
             "global_step": self.global_step,
-            "epoch": self.epoch,
+            "epoch": epoch_to_save,
+            "control_state": self._get_control_state(),
+            "rng_state": capture_rng_state(),
         }
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(ckpt, path)
-        guru.info(f"Saved checkpoint at {self.global_step=} {self.epoch=} to {path}")
+        guru.info(f"Saved checkpoint at {self.global_step=} epoch={epoch_to_save} to {path}")
+
+    def _get_control_state(self) -> dict:
+        """
+        Everything adaptive density control (densify/cull) and the rigidity
+        cache accumulate between checkpoints that isn't captured by the model
+        state_dict itself -- without this, a resumed run would restart
+        density control with empty gradient/visibility stats (an
+        under-informed, noisy first control decision) and rebuild the
+        rigidity graph from scratch instead of reusing the cached one.
+        """
+        def _cpu(t):
+            return t.detach().cpu() if t is not None else None
+
+        return {
+            "running_stats": {k: _cpu(v) for k, v in self.running_stats.items()},
+            "knn_idx": _cpu(self.knn_idx),
+            "rigid_weights": _cpu(self.rigid_weights),
+            "connectivity_knn_idx": _cpu(self.connectivity_knn_idx),
+            "connectivity_valid_mask": _cpu(self.connectivity_valid_mask),
+            "cluster_graph_knn_idx": _cpu(self.cluster_graph_knn_idx),
+            "cluster_graph_valid_mask": _cpu(self.cluster_graph_valid_mask),
+        }
+
+    def _load_control_state(self, state: dict | None) -> None:
+        if not state:
+            return
+
+        def _dev(t):
+            return t.to(self.device) if t is not None else None
+
+        running_stats = state.get("running_stats")
+        if running_stats:
+            for k, v in running_stats.items():
+                self.running_stats[k] = _dev(v)
+        self.knn_idx = _dev(state.get("knn_idx"))
+        self.rigid_weights = _dev(state.get("rigid_weights"))
+        self.connectivity_knn_idx = _dev(state.get("connectivity_knn_idx"))
+        self.connectivity_valid_mask = _dev(state.get("connectivity_valid_mask"))
+        self.cluster_graph_knn_idx = _dev(state.get("cluster_graph_knn_idx"))
+        self.cluster_graph_valid_mask = _dev(state.get("cluster_graph_valid_mask"))
+
+    def restore_pending_rng_state(self) -> None:
+        """
+        Apply the RNG state loaded by init_from_checkpoint (if any). Call
+        this once, right before the training loop starts -- after model,
+        trainer, and DataLoader construction are all done, since those
+        themselves draw from the RNG and would be perturbed by restoring
+        earlier.
+        """
+        if self.pending_rng_state is not None:
+            restore_rng_state(self.pending_rng_state)
+            guru.info("Restored RNG state (python/numpy/torch CPU+CUDA) from checkpoint.")
+            self.pending_rng_state = None
 
     @staticmethod
     def init_from_checkpoint(
@@ -180,18 +287,35 @@ class Trainer:
             trainer.load_checkpoint_optimizers(ckpt["optimizers"])
         if "schedulers" in ckpt:
             trainer.load_checkpoint_schedulers(ckpt["schedulers"])
+        trainer._load_control_state(ckpt.get("control_state"))
+        trainer.pending_rng_state = ckpt.get("rng_state")
         trainer.global_step = ckpt.get("global_step", 0)
         start_epoch = ckpt.get("epoch", 0)
         trainer.set_epoch(start_epoch)
         return trainer, start_epoch
 
     def load_checkpoint_optimizers(self, opt_ckpt):
+        missing = [k for k in self.optimizers if k not in opt_ckpt]
         for k, v in self.optimizers.items():
-            v.load_state_dict(opt_ckpt[k])
+            if k in opt_ckpt:
+                v.load_state_dict(opt_ckpt[k])
+        if missing:
+            guru.info(
+                f"[resume] No optimizer state in checkpoint for {len(missing)} param(s) "
+                f"(new params added since the checkpoint was saved, e.g. GNN wrapping): "
+                f"{missing} -- initialized fresh."
+            )
 
     def load_checkpoint_schedulers(self, sched_ckpt):
+        missing = [k for k in self.scheduler if k not in sched_ckpt]
         for k, v in self.scheduler.items():
-            v.load_state_dict(sched_ckpt[k])
+            if k in sched_ckpt:
+                v.load_state_dict(sched_ckpt[k])
+        if missing:
+            guru.info(
+                f"[resume] No scheduler state in checkpoint for {len(missing)} param(s): "
+                f"{missing} -- initialized fresh."
+            )
 
     @torch.inference_mode()
     def render_fn(self, camera_state: CameraState, img_wh: tuple[int, int]):
@@ -714,6 +838,37 @@ class Trainer:
 
     def compute_losses(self, batch):
         self.model.training = True
+
+        # Edge-boundary correction (flow3d/graph_relative_edge.py): cheap,
+        # every-step refresh of the falloff-row STATE snapshot (current
+        # means/motion_coefs for the Gaussians already assigned to each
+        # edge's boundary) -- unlike refresh_boundary_falloff (called only
+        # from _control_step, on densify/cull) this does no nearest-neighbor
+        # search, just re-gathers by the existing falloff_global_idx, so it's
+        # safe to call every step. Without it, means/motion_coefs keep moving
+        # via their own gradient between control_steps and the GNN's
+        # gap_error/direction (and compute_boundary_gap_loss's dist_before)
+        # would silently drift away from the position actually being
+        # rendered. No-op unless motion_bases is
+        # EdgeBoundaryGraphCorrectedScalableMotionBases.
+        if isinstance(self.model.motion_bases, EdgeBoundaryGraphCorrectedScalableMotionBases):
+            self.model.motion_bases.refresh_falloff_state(
+                self.model.fg.params["means"].detach(), self.model.fg.get_coefs().detach()
+            )
+
+        # flow3d/graph_relative_linear_attention_boundary.py: same rationale
+        # -- cheap, every-step refresh of the per-membership-row STATE
+        # snapshot (current means/motion_coefs for Gaussians already
+        # assigned to an edge/side patch), no nearest-neighbor search. Keeps
+        # the patch pivot (centroid) the GNN sees from drifting away from
+        # the position actually being rendered between control_steps.
+        if isinstance(
+            self.model.motion_bases, RelativeVelLinearAttentionBoundaryGraphCorrectedScalableMotionBases
+        ):
+            self.model.motion_bases.refresh_edge_state(
+                self.model.fg.params["means"].detach(), self.model.fg.get_coefs().detach()
+            )
+
         B = batch["imgs"].shape[0]
         W, H = img_wh = batch["imgs"].shape[2:0:-1]
         N = batch["target_ts"][0].shape[0]
@@ -1010,6 +1165,24 @@ class Trainer:
             # (E, 3n) -> (E, n, 3): axis=-1 becomes the (t-1, t, t+1) triplet.
             boundary_magnitude_triplet = boundary_correction_nbs["magnitude"].reshape(E_edge, 3, n).permute(0, 2, 1)
 
+        # Edge-PATCH correction (t-1, t, t+1) triplet (flow3d/
+        # graph_relative_linear_attention_boundary.py) -- same side-effect
+        # capture pattern, but shaped (E, B, 2, 3) instead of (C, B, 3): the
+        # "2" is side (a/b), not a cluster axis. None for every other variant
+        # (this class defines last_edge_correction, not last_correction, so
+        # gnn_correction_nbs above is always None for it and vice versa).
+        edge_correction_nbs = getattr(self.model.motion_bases, "last_edge_correction", None)
+        if edge_correction_nbs is not None:
+            n = ts_clamp.shape[0]
+            E_patch = edge_correction_nbs["omega"].shape[0]
+            # (E, 3n, 2, 3) -> (E, n, 2, 3, 3): axis=-2 becomes the (t-1, t, t+1) triplet.
+            edge_omega_triplet = (
+                edge_correction_nbs["omega"].reshape(E_patch, 3, n, 2, 3).permute(0, 2, 3, 1, 4)
+            )
+            edge_delta_t_triplet = (
+                edge_correction_nbs["delta_t"].reshape(E_patch, 3, n, 2, 3).permute(0, 2, 3, 1, 4)
+            )
+
         means_fg_nbs = torch.einsum(
             "pnij,pj->pni",
             transfms_nbs,
@@ -1089,6 +1262,10 @@ class Trainer:
         # gnn_correction_nbs, which is why the smoothness loss below reads
         # from the triplet captured earlier instead of from here).
         gnn_correction_cur = getattr(self.model.motion_bases, "last_correction", None)
+        # Same side effect, edge-patch shape (flow3d/graph_relative_linear_
+        # attention_boundary.py). Always None together with gnn_correction_cur
+        # (mutually exclusive: no motion_bases variant defines both).
+        edge_correction_cur = getattr(self.model.motion_bases, "last_edge_correction", None)
 
         ## GNN correction (omega, delta_t) regularizers -- see
         ## flow3d/analysis/loss.py. All no-op (0.0, not computed) for
@@ -1108,13 +1285,77 @@ class Trainer:
 
             edge_index_dir = getattr(self.model.motion_bases.gnn, "edge_index_dir", None)
             if edge_index_dir is not None:
+                # (flow3d/graph_relative_linear_attention_frame.py only)
+                # gnn_correction_cur was captured right after the
+                # compute_transforms_coarse(ts) call above, from the SAME
+                # forward pass's last_correction dict -- so its
+                # "edge_gate_dir" (if present) is guaranteed to be this exact
+                # frame's gate, never a stale value from a different
+                # _corrected_coarse call. Every other variant's
+                # last_correction dict has no such key, so .get(...) is None
+                # and the call below is byte-identical to before.
+                edge_weight = gnn_correction_cur.get("edge_gate_dir")
                 gnn_correction_edge_loss = gnn_correction_edge_consistency_loss(
                     omega_cur,
                     delta_t_cur,
                     edge_index_dir,
                     cos_margin=self.losses_cfg.gnn_correction_edge_consistency_cos_margin,
+                    edge_weight=edge_weight,
                 )
                 loss += gnn_correction_edge_loss * self.losses_cfg.w_gnn_correction_edge_consistency
+
+        ## Edge-PATCH correction (omega + delta_t per edge-SIDE) regularizers
+        ## -- see flow3d/graph_relative_linear_attention_boundary.py. No-op
+        ## (0.0, not computed) unless motion_bases is
+        ## RelativeVelLinearAttentionBoundaryGraphCorrectedScalableMotionBases
+        ## (--gnn_variant=relative_velocity_linear_attention_boundary).
+        ## gnn_correction_magnitude_loss/gnn_correction_smoothness_loss are
+        ## shape-agnostic (operate on the last dim=3 / last two dims=(3,3)),
+        ## so the SAME functions used for the per-cluster (C,B,3) shape above
+        ## apply unmodified to this (E,B,2,3) shape -- only the reshape/
+        ## permute producing the triplet differs (captured above as
+        ## edge_omega_triplet/edge_delta_t_triplet). Regularizes the RAW
+        ## (patch-weight-*before*-application) edge decoder output, matching
+        ## how the per-cluster variant regularizes its own raw last_correction
+        ## -- not the per-Gaussian combined correction, so a raw prediction
+        ## that's currently small only because patch weight is small doesn't
+        ## silently escape regularization. No edge-consistency analog is
+        ## computed here: "neighboring CLUSTERS' single correction vector
+        ## shouldn't oppose" doesn't translate to per-edge-side corrections;
+        ## edge_boundary_gap_loss below is this variant's geometric-
+        ## consistency mechanism instead.
+        edge_correction_reg_loss = torch.tensor(0.0, device=device)
+        edge_correction_smooth_loss = torch.tensor(0.0, device=device)
+        if edge_correction_cur is not None:
+            edge_correction_reg_loss = gnn_correction_magnitude_loss(
+                edge_correction_cur["omega"], edge_correction_cur["delta_t"]
+            )
+            loss += edge_correction_reg_loss * self.losses_cfg.w_edge_correction_reg
+
+            if edge_correction_nbs is not None:
+                edge_correction_smooth_loss = gnn_correction_smoothness_loss(
+                    edge_omega_triplet, edge_delta_t_triplet
+                )
+                loss += edge_correction_smooth_loss * self.losses_cfg.w_edge_correction_smooth
+
+        ## Edge-patch boundary gap loss: OFF by default
+        ## (self.losses_cfg.w_edge_boundary_gap == 0.0). Only applied to
+        ## edges the class itself already judged reliable_edge_mask=True
+        ## (persistence/num_known_frames gated at construction time, see
+        ## flow3d/graph_relative_linear_attention_boundary.py's
+        ## _load_edge_topology_from_edges_pt) AND observed CONNECTED this
+        ## frame -- not every CONNECTED edge. Gradient reaches only
+        ## motion_bases.gnn's own parameters (detach_base=True internally);
+        ## does not disturb last_edge_correction (see that function's
+        ## docstring).
+        edge_boundary_gap_loss_value = torch.tensor(0.0, device=device)
+        if self.losses_cfg.w_edge_boundary_gap > 0 and isinstance(
+            self.model.motion_bases, RelativeVelLinearAttentionBoundaryGraphCorrectedScalableMotionBases
+        ):
+            edge_boundary_gap_loss_value = compute_edge_patch_gap_loss(
+                self.model.motion_bases, ts, tolerance=self.losses_cfg.edge_boundary_gap_tolerance
+            )
+            loss += edge_boundary_gap_loss_value * self.losses_cfg.w_edge_boundary_gap
 
         ## Edge-boundary correction (omega-free, per-edge translation
         ## magnitude) regularizers -- see flow3d/graph_relative_edge.py. Both
@@ -1133,27 +1374,26 @@ class Trainer:
             boundary_correction_smooth_loss = boundary_magnitude_smoothness_loss(boundary_magnitude_triplet)
             loss += boundary_correction_smooth_loss * self.losses_cfg.w_boundary_correction_smooth
 
-        ## Boundary gap loss: keeps each edge-boundary-corrected cluster pair
-        ## from opening beyond (canonical_distance + tolerance) in the ACTUAL
-        ## rendered (coarse+fine-blended) geometry -- see
-        ## flow3d/graph_relative_edge.py's compute_boundary_gap_loss for the
-        ## hinge/isolation details (only motion_bases.gnn's own parameters get
-        ## gradient from this loss; within tolerance it's exactly 0). Reads
-        ## motion_bases's own (live, densify/cull-refreshed) falloff rows
-        ## directly, so unlike joint_anchor_loss below it needs no separate
-        ## cached boundary set or file path. No-op (0.0, not even computed)
-        ## unless motion_bases is EdgeBoundaryGraphCorrectedScalableMotionBases
-        ## (--gnn_variant=relative_edge_boundary).
+        ## Boundary gap loss: OFF by default (self.losses_cfg.w_boundary_gap
+        ## defaults to 0.0) -- correction magnitude is now learned directly
+        ## from the render loss (RGB/depth/mask/track, via compute_transforms's
+        ## detach_base=False path into EdgeBoundaryGraphCorrectedScalableMotion
+        ## Bases._edge_features_and_direction), not gated by this hinge any
+        ## more (see flow3d/graph_relative_edge.py's EdgeBoundaryGNN docstring
+        ## for why: contact_reference_distance is a median over this SAME
+        ## reconstruction's own "connected" frames, so a persistently-open
+        ## edge has it absorbed as "normal" and the old gap_error-gated
+        ## correction could never learn to close it). Kept as an opt-in extra
+        ## loss (set --loss.w-boundary-gap > 0 to enable) and for
+        ## compute_boundary_gap_distances-based diagnostics
+        ## (flow3d/analysis/gnn_check_edge.py) -- guarded so the (otherwise
+        ## redundant) extra forward pass through _edge_features_and_direction
+        ## is skipped while the weight is 0.
         boundary_gap_loss_value = torch.tensor(0.0, device=device)
-        if isinstance(self.model.motion_bases, EdgeBoundaryGraphCorrectedScalableMotionBases):
-            boundary_gap_loss_value = compute_boundary_gap_loss(
-                self.model.motion_bases,
-                ts,
-                self.model.fg.params["means"].detach(),
-                self.model.fg.get_coefs().detach(),
-                self.model.fg.get_cluster_ids().reshape(-1).long(),
-                tolerance=self.losses_cfg.boundary_gap_tolerance,
-            )
+        if self.losses_cfg.w_boundary_gap > 0 and isinstance(
+            self.model.motion_bases, EdgeBoundaryGraphCorrectedScalableMotionBases
+        ):
+            boundary_gap_loss_value = compute_boundary_gap_loss(self.model.motion_bases, ts)
             loss += boundary_gap_loss_value * self.losses_cfg.w_boundary_gap
 
         ## Joint anchor loss (GNN-only, true-transform target): keeps each
@@ -1185,6 +1425,19 @@ class Trainer:
                     "GNN correction and is not supported with "
                     "gnn_variant='relative_edge_boundary' -- use "
                     "optim_cfg.boundary_gap_path instead (see flow3d/graph_relative_edge.py)."
+                )
+            if isinstance(
+                self.model.motion_bases, RelativeVelLinearAttentionBoundaryGraphCorrectedScalableMotionBases
+            ):
+                raise ValueError(
+                    "optim_cfg.joint_anchor_path targets the per-cluster (omega, delta_t) "
+                    "GNN correction (flow3d/analysis/loss_joint_gnn_only.py's "
+                    "_gnn_only_compute_transforms calls motion_bases.gnn with the per-cluster "
+                    "4-argument signature) and is not supported with "
+                    "gnn_variant='relative_velocity_linear_attention_boundary' (its GNN takes an "
+                    "extra edge-patch-feature argument and returns a per-edge-side shape) -- use "
+                    "--loss.w_edge_boundary_gap instead (see "
+                    "flow3d/graph_relative_linear_attention_boundary.py's compute_edge_patch_gap_loss)."
                 )
             if self.joint_anchor_boundary_sets is None:
                 self.joint_anchor_boundary_sets = build_joint_anchor_boundary_sets(
@@ -1269,6 +1522,9 @@ class Trainer:
             "train/boundary_correction_reg_loss": boundary_correction_reg_loss.item(),
             "train/boundary_correction_smooth_loss": boundary_correction_smooth_loss.item(),
             "train/boundary_gap_loss": boundary_gap_loss_value.item(),
+            "train/edge_correction_reg_loss": edge_correction_reg_loss.item(),
+            "train/edge_correction_smooth_loss": edge_correction_smooth_loss.item(),
+            "train/edge_boundary_gap_loss": edge_boundary_gap_loss_value.item(),
             "train/joint_anchor_loss": joint_anchor_loss_value.item(),
             "train/num_gaussians": self.model.num_gaussians,
             "train/num_fg_gaussians": self.model.num_fg_gaussians,
@@ -1454,11 +1710,37 @@ class Trainer:
                 mb.refresh_boundary_falloff(
                     self.model.fg.params["means"].detach(),
                     self.model.fg.get_cluster_ids().reshape(-1).long(),
+                    self.model.fg.get_coefs().detach(),
                 )
                 guru.info(
                     f"[boundary-falloff] refreshed at {step=}: "
                     f"num_fg_gaussians={mb.num_fg_gaussians.item()} "
                     f"falloff_rows={mb.falloff_global_idx.numel()}"
+                )
+
+        # flow3d/graph_relative_linear_attention_boundary.py: same rationale
+        # as the edge-boundary refresh above -- the per-Gaussian edge/side
+        # membership ASSIGNMENT (which current Gaussian belongs to which
+        # edge/side patch, and how much) is keyed by canonical identity, so
+        # it must be recomputed whenever the foreground Gaussian array is
+        # resized/reordered by densify/cull. The canonical boundary
+        # reference (patch_ref_*) and edge topology (edge_cluster_a/b) are
+        # untouched. Expensive (nearest-neighbor search) -- only run on an
+        # actual count change, same as the edge-boundary variant above.
+        if isinstance(
+            self.model.motion_bases, RelativeVelLinearAttentionBoundaryGraphCorrectedScalableMotionBases
+        ):
+            mb = self.model.motion_bases
+            if int(mb.num_fg_gaussians) != self.model.fg.num_gaussians:
+                mb.refresh_edge_membership(
+                    self.model.fg.params["means"].detach(),
+                    self.model.fg.get_cluster_ids().reshape(-1).long(),
+                    self.model.fg.get_coefs().detach(),
+                )
+                guru.info(
+                    f"[edge-patch-membership] refreshed at {step=}: "
+                    f"num_fg_gaussians={mb.num_fg_gaussians.item()} "
+                    f"membership_rows={mb.row_gaussian_idx.numel()}"
                 )
 
     @torch.no_grad()

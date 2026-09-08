@@ -7,6 +7,9 @@ from torch import Tensor
 
 from flow3d.params import GaussianParams, MotionBases, ScalableMotionBases, CameraPoses
 from flow3d.graph_relative_edge import EdgeBoundaryGraphCorrectedScalableMotionBases
+from flow3d.graph_relative_linear_attention_boundary import (
+    RelativeVelLinearAttentionBoundaryGraphCorrectedScalableMotionBases,
+)
 
 
 class SceneModel(nn.Module):
@@ -105,11 +108,19 @@ class SceneModel(nn.Module):
             coefs = coefs[inds]
             if cluster_ids is not None:
                 cluster_ids = cluster_ids[inds]
-        if isinstance(self.motion_bases, EdgeBoundaryGraphCorrectedScalableMotionBases):
-            # Its per-Gaussian boundary correction is keyed by global identity
-            # (not just cluster id), so it needs to know which canonical
-            # Gaussian each queried row actually is -- see
-            # flow3d/graph_relative_edge.py's compute_transforms docstring.
+        if isinstance(
+            self.motion_bases,
+            (
+                EdgeBoundaryGraphCorrectedScalableMotionBases,
+                RelativeVelLinearAttentionBoundaryGraphCorrectedScalableMotionBases,
+            ),
+        ):
+            # Their per-Gaussian boundary weight/correction is keyed by global
+            # identity (not just cluster id), so they need to know which
+            # canonical Gaussian each queried row actually is -- see
+            # flow3d/graph_relative_edge.py's and
+            # flow3d/graph_relative_linear_attention_boundary.py's
+            # compute_transforms docstrings.
             global_indices = (
                 inds if inds is not None else torch.arange(coefs.shape[0], device=coefs.device)
             )
@@ -248,14 +259,28 @@ class SceneModel(nn.Module):
                 state_dict, prefix=f"{prefix}bg."
             )
         gnn_prefix = f"{prefix}motion_bases.gnn."
-        if f"{prefix}motion_bases.edge_cluster_a" in state_dict:
-            # flow3d/graph_relative_edge.py: per-edge boundary correction
-            # (translation-only, applied only near cluster-pair boundaries).
-            # Its own top-level "edge_cluster_a" buffer (not nested under
-            # ".gnn.") is a marker distinct from the per-cluster
-            # relative_velocity_linear_attention format below.
+        if f"{prefix}motion_bases.row_weight" in state_dict:
+            # Boundary-attention checkpoints also contain edge_cluster_a, so
+            # check their unique row_weight marker before the legacy variant.
+            motion_bases = (
+                RelativeVelLinearAttentionBoundaryGraphCorrectedScalableMotionBases.init_from_state_dict(
+                    state_dict, prefix=f"{prefix}motion_bases."
+                )
+            )
+        elif f"{prefix}motion_bases.edge_cluster_a" in state_dict:
+            # Legacy per-edge boundary correction, after row_weight is ruled out.
             motion_bases = EdgeBoundaryGraphCorrectedScalableMotionBases.init_from_state_dict(
                 state_dict, prefix=f"{prefix}motion_bases."
+            )
+        elif f"{gnn_prefix}edge_gate_dir_full" in state_dict:
+            from flow3d.graph_relative_linear_attention_frame import (
+                RelativeVelLinearAttentionFrameGraphCorrectedScalableMotionBases,
+            )
+
+            motion_bases = (
+                RelativeVelLinearAttentionFrameGraphCorrectedScalableMotionBases.init_from_state_dict(
+                    state_dict, prefix=f"{prefix}motion_bases."
+                )
             )
         elif any(k.startswith(gnn_prefix) for k in state_dict):
             # The repository supports one per-cluster graph-corrected checkpoint
