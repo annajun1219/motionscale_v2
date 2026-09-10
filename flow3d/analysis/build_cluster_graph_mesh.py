@@ -168,7 +168,7 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -232,6 +232,14 @@ _CONTACT_WINDOW_MIN_COUNT = 3
 # ---------------------------------------------------------------------------
 # Config / result dataclasses
 # ---------------------------------------------------------------------------
+
+
+class FrameRenderConfig(Protocol):
+    """Settings shared by mesh rendering and local-node visibility discovery."""
+
+    tau_o: float
+    mask_alpha_threshold: float
+    depth_jump_ratio: float
 
 
 @dataclass
@@ -818,7 +826,7 @@ def render_frame_mesh(
     w2c: torch.Tensor,
     intrinsic: torch.Tensor,
     image_size: tuple[int, int],
-    cfg: MeshGraphConfig,
+    cfg: FrameRenderConfig,
 ) -> FrameRenderData:
     """Build one sampled frame's visible-surface mesh directly from that
     frame's own rendered alpha mask + depth (see module docstring). Shared

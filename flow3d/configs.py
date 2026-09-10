@@ -112,6 +112,21 @@ class LossesConfig:
     w_gnn_correction_edge_consistency: float = 0.01
     gnn_correction_edge_consistency_cos_margin: float = 0.5
 
+    ### Local-node attention GNN correction regularizers -- see
+    # flow3d/graph_relative_local_attention.py. Only active when motion_bases
+    # is LocalRelativeAttentionGraphCorrectedScalableMotionBases
+    # (--enable_local_gnn), no-op (0.0, not even computed) otherwise. All
+    # three are 0.0 while the GNN head is still zero-initialized. Independent
+    # of --enable_graph_coupling's w_gnn_correction_* above (different
+    # granularity: per-cluster there, per-local-node here) -- the two paths
+    # are mutually exclusive per run, so only one set is ever nonzero.
+    w_local_gnn_correction_reg: float = 0.01
+    w_local_gnn_correction_smooth: float = 0.01
+    # Huber loss pulling each target's real corrected center toward the
+    # rigid-consistency position its valid (message_source) neighbors
+    # predict for it -- see flow3d/analysis/loss.py's local_gnn_anchor_loss.
+    w_local_gnn_anchor: float = 0.1
+
     ### Edge-boundary correction (omega-free, per-edge translation magnitude)
     # regularizers -- see flow3d/graph_relative_edge.py. Only active when
     # motion_bases is EdgeBoundaryGraphCorrectedScalableMotionBases
@@ -251,6 +266,26 @@ class OptimConfig:
     # these don't appear in SceneLRConfig since they're not a "fg"/"bg"/"motion_bases"
     # leaf param, so Trainer.configure_optimizers gives them their own param group.
     gnn_lr: float = 1e-3
+    # GNN 시작 후, 이 epoch 전까지 기존 motion_bases를 고정
+    # -1이면 고정 기능 사용 안 함
+    gnn_freeze_base_motion_until_epoch: int = -1
+
+    # 고정 해제 후 기존 motion_bases에 적용할 LR 배율
+    gnn_base_motion_lr_scale: float = 0.1
+
+    ### Local-node attention GNN (see flow3d/graph_relative_local_attention.py)
+    # -- own LR for the same reason gnn_lr is separate above (its
+    # encoder/message-passing/head aren't a "fg"/"bg"/"motion_bases" leaf
+    # param either). Independent of --enable_graph_coupling's gnn_lr.
+    local_gnn_lr: float = 1e-3
+    # How often (in training steps) Trainer.compute_losses re-runs the
+    # nearest-neighbor search for hard node membership + top-k RBF candidates
+    # (flow3d/graph_relative_local_attention.py's refresh_local_node_assignment),
+    # on top of the densify/cull-triggered refresh in Trainer.control_step --
+    # canonical means drift under their own gradient between control_steps
+    # (which only fire once per epoch) even with no Gaussian-count change.
+    local_gnn_refresh_every: int = 100
+
     ### Joint anchor loss (see flow3d/analysis/loss_joint.py). Path to an
     # edges.pt built by flow3d/analysis/build_cluster_graph.py -- normally
     # the exact same path passed to --graph-coupling-path, so the loss only
@@ -409,6 +444,22 @@ class TrainConfig:
     # (typically <work_dir>/analysis/cluster_graph_mesh/boundary_patch.pt).
     # Required when gnn_variant is this value; unused otherwise.
     boundary_patch_path: str | None = None
+
+    ### Local-node attention GNN (see flow3d/graph_relative_local_attention.py)
+    # -- a SEPARATE, independent correction path from --enable_graph_coupling
+    # above (per-local-node, finer than a cluster, applied via top-k RBF
+    # blend onto individual live Gaussians -- not a --gnn_variant choice,
+    # since it needs a different graph format entirely: local_graph_path
+    # points at flow3d/graph_local_target.py's output, not edges.pt).
+    # Mutually exclusive with --enable_graph_coupling for this experiment --
+    # run_training.py asserts against passing both.
+    enable_local_gnn: bool = False
+    # Path to a graph_relative_local.pt built by flow3d/graph_local_target.py
+    # (target_mask/message_source_mask/node_confidence/node_center/edge_index/
+    # node_parent_cluster_id). Required when --enable_local_gnn.
+    local_graph_path: str | None = None
+    # k for the per-Gaussian top-k RBF blend of nearby local nodes' correction.
+    local_gnn_topk: int = 4
 
     # Training
     num_glob_epochs: int = 400

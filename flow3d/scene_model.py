@@ -10,6 +10,9 @@ from flow3d.graph_relative_edge import EdgeBoundaryGraphCorrectedScalableMotionB
 from flow3d.graph_relative_linear_attention_boundary import (
     RelativeVelLinearAttentionBoundaryGraphCorrectedScalableMotionBases,
 )
+from flow3d.graph_relative_local_attention import (
+    LocalRelativeAttentionGraphCorrectedScalableMotionBases,
+)
 
 
 class SceneModel(nn.Module):
@@ -113,14 +116,16 @@ class SceneModel(nn.Module):
             (
                 EdgeBoundaryGraphCorrectedScalableMotionBases,
                 RelativeVelLinearAttentionBoundaryGraphCorrectedScalableMotionBases,
+                LocalRelativeAttentionGraphCorrectedScalableMotionBases,
             ),
         ):
             # Their per-Gaussian boundary weight/correction is keyed by global
             # identity (not just cluster id), so they need to know which
             # canonical Gaussian each queried row actually is -- see
-            # flow3d/graph_relative_edge.py's and
-            # flow3d/graph_relative_linear_attention_boundary.py's
-            # compute_transforms docstrings.
+            # flow3d/graph_relative_edge.py's,
+            # flow3d/graph_relative_linear_attention_boundary.py's, and
+            # flow3d/graph_relative_local_attention.py's compute_transforms
+            # docstrings.
             global_indices = (
                 inds if inds is not None else torch.arange(coefs.shape[0], device=coefs.device)
             )
@@ -280,6 +285,20 @@ class SceneModel(nn.Module):
             motion_bases = (
                 RelativeVelLinearAttentionFrameGraphCorrectedScalableMotionBases.init_from_state_dict(
                     state_dict, prefix=f"{prefix}motion_bases."
+                )
+            )
+        elif f"{gnn_prefix}node_center_seed" in state_dict:
+            # LocalRelativeAttentionGraphCorrectedScalableMotionBases's own
+            # unique marker -- must be checked before the generic gnn_prefix
+            # catch-all below, which would otherwise misidentify it as the
+            # plain relative_velocity_linear_attention (per-cluster) variant.
+            motion_bases = (
+                LocalRelativeAttentionGraphCorrectedScalableMotionBases.init_from_state_dict(
+                    state_dict,
+                    prefix=f"{prefix}motion_bases.",
+                    canonical_means=fg.params["means"].detach(),
+                    cluster_ids_all=fg.get_cluster_ids().reshape(-1).long(),
+                    coefs_all=fg.get_coefs().detach(),
                 )
             )
         elif any(k.startswith(gnn_prefix) for k in state_dict):

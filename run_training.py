@@ -394,9 +394,18 @@ def initialize_and_checkpoint_model(
         ckpt_path, so an externally-supplied --ckpt_path source is never
         overwritten, and returns that copy's path.
     """
+    assert not (cfg.enable_graph_coupling and cfg.enable_local_gnn), (
+        "enable_graph_coupling and enable_local_gnn are mutually exclusive for this experiment -- "
+        "the coarse (per-cluster) GNN and the local-node attention GNN are two independent "
+        "correction paths, only one of which should wrap motion_bases."
+    )
     if os.path.exists(ckpt_path):
         if cfg.enable_graph_coupling:
             wrapped_path = _wrap_checkpoint_with_graph_coupling(cfg, ckpt_path, train_dataset.num_frames)
+            if wrapped_path is not None:
+                return wrapped_path
+        if cfg.enable_local_gnn:
+            wrapped_path = _wrap_checkpoint_with_local_gnn(cfg, ckpt_path)
             if wrapped_path is not None:
                 return wrapped_path
         guru.info(f"model checkpoint exists at {ckpt_path}")
@@ -470,6 +479,41 @@ def initialize_and_checkpoint_model(
             f"{GraphBasesCls.__name__} (variant={cfg.gnn_variant}, "
             f"hidden={cfg.gnn_hidden}, layers={cfg.gnn_layers}, "
             f"edges={edge_index.shape[1]}, from {cfg.graph_coupling_path})"
+        )
+
+    if cfg.enable_local_gnn:
+        assert not cfg.optim.enable_bases_control, (
+            "enable_local_gnn requires --optim.no-enable-bases-control: bases split/cull would "
+            "remap cluster ids that graph_relative_local.pt's parent_cluster_id doesn't know about "
+            "(Gaussian-level densify/cull is fine and handled via refresh_local_node_assignment)."
+        )
+        assert cfg.local_graph_path, (
+            "enable_local_gnn=True requires --local_graph_path to point to a graph_relative_local.pt "
+            "built by flow3d/graph_local_target.py."
+        )
+        from flow3d.graph_relative_local_attention import (
+            LocalRelativeAttentionGraphCorrectedScalableMotionBases,
+        )
+
+        canonical_means = fg_params.params["means"].detach()
+        cluster_ids_all = fg_params.get_cluster_ids().reshape(-1).long()
+        coefs_all = fg_params.get_coefs().detach()
+        motion_bases = LocalRelativeAttentionGraphCorrectedScalableMotionBases.from_scalable_motion_bases(
+            motion_bases,
+            local_graph_path=cfg.local_graph_path,
+            canonical_means=canonical_means,
+            cluster_ids_all=cluster_ids_all,
+            coefs_all=coefs_all,
+            gnn_hidden_dim=cfg.gnn_hidden,
+            gnn_num_layers=cfg.gnn_layers,
+            gnn_num_heads=cfg.gnn_heads,
+            topk=cfg.local_gnn_topk,
+        ).to(device)
+        guru.info(
+            f"Local-node attention GNN enabled: wrapped motion_bases with "
+            f"LocalRelativeAttentionGraphCorrectedScalableMotionBases (hidden={cfg.gnn_hidden}, "
+            f"layers={cfg.gnn_layers}, heads={cfg.gnn_heads}, topk={cfg.local_gnn_topk}, "
+            f"from {cfg.local_graph_path})"
         )
 
     # Initialize scene model — camera poses only for init frames, new frames added during propagation
@@ -611,6 +655,88 @@ def _wrap_checkpoint_with_graph_coupling(
         f"{ckpt.get('epoch', 0)}, global_step={ckpt.get('global_step', 0)}, "
         f"optimizer/scheduler/control_state/rng_state all carried over -- "
         f"only the new GNN params get a fresh optimizer)."
+    )
+    os.makedirs(os.path.dirname(target_ckpt_path), exist_ok=True)
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizers": ckpt.get("optimizers", {}),
+            "schedulers": ckpt.get("schedulers", {}),
+            "control_state": ckpt.get("control_state"),
+            "rng_state": ckpt.get("rng_state"),
+            "epoch": ckpt.get("epoch", 0),
+            "global_step": ckpt.get("global_step", 0),
+        },
+        target_ckpt_path,
+    )
+    return target_ckpt_path
+
+
+def _wrap_checkpoint_with_local_gnn(cfg: TrainConfig, source_ckpt_path: str) -> str | None:
+    """Resume support for --enable_local_gnn starting from a checkpoint
+    trained WITHOUT it (plain ScalableMotionBases motion_bases): wraps
+    motion_bases with LocalRelativeAttentionGraphCorrectedScalableMotionBases
+    in place and writes the result to cfg.work_dir's own checkpoints/last.ckpt,
+    leaving source_ckpt_path itself untouched -- same shape as
+    _wrap_checkpoint_with_graph_coupling, just for the local-node path (a
+    single class, no gnn_variant dispatch, no gate-regeneration case).
+
+    The wrap is exactly from_scalable_motion_bases: coarse/fine motion params
+    are copied as-is and only the GNN correction is added, zero-initialized,
+    so it's a no-op the instant training resumes. Optimizer/scheduler/trainer
+    state is carried over from source_ckpt_path untouched -- only the new
+    motion_bases.gnn.* params get a fresh Adam optimizer.
+
+    :return: path to the wrapped checkpoint, or None if source_ckpt_path is
+        already local-gnn-wrapped (has a "motion_bases.gnn.node_center_seed"
+        key): nothing to do, SceneModel.init_from_state_dict already restores
+        it correctly as-is.
+    """
+    assert cfg.local_graph_path, (
+        "enable_local_gnn=True requires --local_graph_path to point to a graph_relative_local.pt "
+        "built by flow3d/graph_local_target.py."
+    )
+    assert not cfg.optim.enable_bases_control, (
+        "enable_local_gnn requires --optim.no-enable-bases-control: bases split/cull would remap "
+        "cluster ids that graph_relative_local.pt's parent_cluster_id doesn't know about."
+    )
+
+    ckpt = torch.load(source_ckpt_path, map_location="cpu", weights_only=False)
+    state_dict = ckpt["model"]
+    if "motion_bases.gnn.node_center_seed" in state_dict:
+        return None
+
+    from flow3d.graph_relative_local_attention import (
+        LocalRelativeAttentionGraphCorrectedScalableMotionBases,
+    )
+    from flow3d.params import ScalableMotionBases
+
+    plain_motion_bases = ScalableMotionBases.init_from_state_dict(state_dict, prefix="motion_bases.params.")
+    model = SceneModel.init_from_state_dict(state_dict)
+    canonical_means = model.fg.params["means"].detach()
+    cluster_ids_all = model.fg.get_cluster_ids().reshape(-1).long()
+    coefs_all = model.fg.get_coefs().detach()
+    model.motion_bases = LocalRelativeAttentionGraphCorrectedScalableMotionBases.from_scalable_motion_bases(
+        plain_motion_bases,
+        local_graph_path=cfg.local_graph_path,
+        canonical_means=canonical_means,
+        cluster_ids_all=cluster_ids_all,
+        coefs_all=coefs_all,
+        gnn_hidden_dim=cfg.gnn_hidden,
+        gnn_num_layers=cfg.gnn_layers,
+        gnn_num_heads=cfg.gnn_heads,
+        topk=cfg.local_gnn_topk,
+    )
+
+    target_ckpt_path = os.path.join(cfg.work_dir, "checkpoints/last.ckpt")
+    guru.info(
+        f"Resume: {source_ckpt_path} has plain motion_bases -- wrapping with "
+        f"LocalRelativeAttentionGraphCorrectedScalableMotionBases (hidden={cfg.gnn_hidden}, "
+        f"layers={cfg.gnn_layers}, heads={cfg.gnn_heads}, topk={cfg.local_gnn_topk}, "
+        f"from {cfg.local_graph_path}; correction zero-initialized) and saving to "
+        f"{target_ckpt_path} (source left untouched, epoch={ckpt.get('epoch', 0)}, "
+        f"global_step={ckpt.get('global_step', 0)}, optimizer/scheduler/control_state/rng_state "
+        f"all carried over -- only the new GNN params get a fresh optimizer)."
     )
     os.makedirs(os.path.dirname(target_ckpt_path), exist_ok=True)
     torch.save(

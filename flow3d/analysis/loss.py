@@ -61,6 +61,7 @@ __all__ = [
     "gnn_correction_magnitude_loss",
     "gnn_correction_smoothness_loss",
     "gnn_correction_edge_consistency_loss",
+    "local_gnn_anchor_loss",
 ]
 
 
@@ -175,6 +176,38 @@ def gnn_correction_edge_consistency_loss(
     return weight_rot * rot_term + weight_transl * transl_term
 
 
+def local_gnn_anchor_loss(
+    corrected: torch.Tensor,
+    predicted: torch.Tensor,
+    beta: float = 0.01,
+) -> torch.Tensor:
+    """
+    Huber anchor loss for flow3d/graph_relative_local_attention.py's
+    LocalRelativeAttentionGNN: pulls each target node's ACTUAL corrected
+    center (mean of its member Gaussians' real post-correction positions --
+    the top-k RBF blend + pivoted rotation already applied, not a node-level
+    shortcut) toward the rigid-consistency position its valid (message_source)
+    neighbors predict for it. Robust (Huber, not L2) since a neighbor's
+    rigid-consistency prediction can be a poor match at a genuinely
+    non-rigid joint -- such (target, frame) pairs shouldn't get an
+    unbounded gradient.
+
+    Already-flattened to the (target, frame) pairs that actually have >=1
+    valid source this step -- the caller (the wrapper's forward pass) is
+    responsible for that selection; pairs with 0 sources have no prediction
+    to anchor to and are skipped before ever reaching this function.
+
+    :param corrected: (M, 3) each target's real corrected center this step.
+    :param predicted: (M, 3) same (target, frame) pairs' source-predicted
+        position (mean over valid sources of `p_j^t + R_j^t @ d_ij^0`).
+    :return: scalar; `corrected.new_zeros(())` if M == 0.
+    """
+    if corrected.shape[0] == 0:
+        return corrected.new_zeros(())
+    dist = (corrected - predicted).norm(dim=-1)  # (M,)
+    return F.huber_loss(dist, torch.zeros_like(dist), delta=beta, reduction="mean")
+
+
 if __name__ == "__main__":
     # Sanity checks:
     #   1. all three losses are exactly 0 at zero correction (zero-init equivalence).
@@ -279,5 +312,30 @@ if __name__ == "__main__":
         f"{edge_opp_weight_partial.item():.3e} vs expected {expected_partial:.3e}"
     )
     assert abs(edge_opp_weight_partial.item() - expected_partial) < 1e-6
+
+    # --- 6. local_gnn_anchor_loss: 0 at perfect agreement, grows with distance,
+    #     robust (sub-quadratic) for far outliers, empty input -> exactly 0 ---
+    M = 5
+    predicted = torch.randn(M, 3)
+    anchor_zero = local_gnn_anchor_loss(predicted.clone(), predicted, beta=0.01)
+    print(f"[anchor] exact match = {anchor_zero.item():.3e}")
+    assert anchor_zero.item() == 0.0
+
+    small_offset = predicted + 0.001  # well inside beta -> ~quadratic regime
+    anchor_small = local_gnn_anchor_loss(small_offset, predicted, beta=0.01)
+    large_offset = predicted + 10.0  # far outside beta -> linear regime
+    anchor_large = local_gnn_anchor_loss(large_offset, predicted, beta=0.01)
+    print(f"[anchor] small_offset={anchor_small.item():.3e} large_offset={anchor_large.item():.3e}")
+    assert 0.0 < anchor_small.item() < anchor_large.item()
+    # robustness: a 1000x larger offset should NOT cost ~1e6x more (that would be pure L2) --
+    # Huber's linear-beyond-beta regime keeps the ratio close to the offset-distance ratio, not its square.
+    dist_ratio = (large_offset - predicted).norm(dim=-1).mean() / (small_offset - predicted).norm(dim=-1).mean()
+    loss_ratio = anchor_large.item() / anchor_small.item()
+    print(f"[anchor] dist_ratio={dist_ratio.item():.1f} loss_ratio={loss_ratio:.1f} (robust: not dist_ratio^2)")
+    assert loss_ratio < dist_ratio.item() ** 2 / 10
+
+    anchor_empty = local_gnn_anchor_loss(torch.zeros(0, 3), torch.zeros(0, 3), beta=0.01)
+    print(f"[anchor] empty input = {anchor_empty.item():.3e}")
+    assert anchor_empty.item() == 0.0
 
     print("OK")

@@ -29,6 +29,7 @@ from flow3d.analysis.loss import (
     gnn_correction_magnitude_loss,
     gnn_correction_smoothness_loss,
     gnn_correction_edge_consistency_loss,
+    local_gnn_anchor_loss,
 )
 from flow3d.analysis.loss_joint import joint_anchor_loss
 from flow3d.analysis.loss_joint_gnn_only import (
@@ -45,6 +46,9 @@ from flow3d.graph_relative_edge import (
 from flow3d.graph_relative_linear_attention_boundary import (
     RelativeVelLinearAttentionBoundaryGraphCorrectedScalableMotionBases,
     compute_edge_patch_gap_loss,
+)
+from flow3d.graph_relative_local_attention import (
+    LocalRelativeAttentionGraphCorrectedScalableMotionBases,
 )
 from flow3d.data.utils import compute_depth_normal_mask, to_device
 from flow3d.metrics import PCK, mLPIPS, mPSNR, mSSIM
@@ -144,6 +148,8 @@ class Trainer:
         self.writer = SummaryWriter(log_dir=work_dir)
         self.global_step = 0
         self.epoch = 0
+        # 현재 기존 motion_bases가 freeze 상태인지 기록
+        self._gnn_base_motion_frozen: bool | None = None
         self.pose_optimize_intervals: list[tuple[int, int]] = []  # [(start, end), ...], empty = never optimize
         # RNG state loaded from a checkpoint (see init_from_checkpoint), held
         # here until restore_pending_rng_state() is called. Deliberately not
@@ -179,6 +185,43 @@ class Trainer:
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
+        self._update_gnn_base_motion_grad()
+
+
+    def _update_gnn_base_motion_grad(self):
+        """GNN 적응 기간에는 기존 motion parameter를 고정하고,
+        이후 다시 학습 가능하게 만든다.
+        """
+        motion_bases = self.model.motion_bases
+
+        # per-cluster GNN이 아닌 일반 MotionScale/boundary GNN이면 적용하지 않음
+        if not hasattr(motion_bases, "last_correction"):
+            return
+
+        freeze_until = self.optim_cfg.gnn_freeze_base_motion_until_epoch
+
+        # -1이면 freeze 기능 비활성화
+        freeze_base = freeze_until >= 0 and self.epoch < freeze_until
+
+        # 상태가 바뀌지 않았으면 반복 처리하지 않음
+        if self._gnn_base_motion_frozen == freeze_base:
+            return
+
+        # centers, rots, transls, fine_rots, fine_transls 고정/해제
+        for param in motion_bases.params.values():
+            param.requires_grad_(not freeze_base)
+
+        # GNN은 항상 학습
+        for param in motion_bases.gnn.parameters():
+            param.requires_grad_(True)
+
+        self._gnn_base_motion_frozen = freeze_base
+
+        guru.info(
+            f"[GNN stage] epoch={self.epoch}: "
+            f"base motion={'FROZEN' if freeze_base else 'TRAINABLE'}, "
+            f"GNN=TRAINABLE"
+        )
 
     def set_pose_grad(self, optimize: bool):
         if self.model.camera_poses is None:
@@ -282,6 +325,15 @@ class Trainer:
         state_dict = ckpt["model"]
         model = SceneModel.init_from_state_dict(state_dict)
         model = model.to(device)
+        if isinstance(
+            model.motion_bases,
+            LocalRelativeAttentionGraphCorrectedScalableMotionBases,
+        ):
+            model.motion_bases.refresh_local_node_assignment(
+                model.fg.params["means"].detach(),
+                model.fg.get_cluster_ids().reshape(-1).long(),
+                model.fg.get_coefs().detach(),
+            )
         trainer = Trainer(model, device, *args, **kwargs)
         if "optimizers" in ckpt:
             trainer.load_checkpoint_optimizers(ckpt["optimizers"])
@@ -869,6 +921,25 @@ class Trainer:
                 self.model.fg.params["means"].detach(), self.model.fg.get_coefs().detach()
             )
 
+        # flow3d/graph_relative_local_attention.py: PERIODIC (not every-step)
+        # refresh of hard node membership + top-k RBF candidate set, on top of
+        # the densify/cull-triggered one in control_step (Trainer.control_step)
+        # -- canonical means keep moving under their own gradient between
+        # control_steps (which only fire once per epoch) with no Gaussian-count
+        # change at all, so membership/top-k can go stale from position drift
+        # alone. Expensive (nearest-neighbor search per cluster), so gated to
+        # every --local-gnn-refresh-every training steps, not every step (unlike
+        # the cheap STATE-only refreshes above, this one redoes the search).
+        if (
+            isinstance(self.model.motion_bases, LocalRelativeAttentionGraphCorrectedScalableMotionBases)
+            and self.global_step % self.optim_cfg.local_gnn_refresh_every == 0
+        ):
+            self.model.motion_bases.refresh_local_node_assignment(
+                self.model.fg.params["means"].detach(),
+                self.model.fg.get_cluster_ids().reshape(-1).long(),
+                self.model.fg.get_coefs().detach(),
+            )
+
         B = batch["imgs"].shape[0]
         W, H = img_wh = batch["imgs"].shape[2:0:-1]
         N = batch["target_ts"][0].shape[0]
@@ -1374,6 +1445,49 @@ class Trainer:
             boundary_correction_smooth_loss = boundary_magnitude_smoothness_loss(boundary_magnitude_triplet)
             loss += boundary_correction_smooth_loss * self.losses_cfg.w_boundary_correction_smooth
 
+        ## Local-node attention GNN correction regularizers + anchor loss --
+        ## see flow3d/graph_relative_local_attention.py and
+        ## flow3d/analysis/loss.py. No-op (0.0, not computed) unless
+        ## motion_bases is LocalRelativeAttentionGraphCorrectedScalableMotionBases
+        ## (--enable_local_gnn). Reuses the SAME (t-1, t, t+1) capture as
+        ## gnn_correction_nbs above (from compute_transforms(ts_neighbors) at
+        ## the top of this function) for BOTH the magnitude-reg
+        ## (current-frame middle slice, same convention as
+        ## boundary_magnitude_triplet[:, :, 1] above) and smoothness losses --
+        ## this class doesn't override compute_transforms_coarse (correction
+        ## applies post coarse+fine blend, not to the cluster skeleton), so
+        ## there's no separate cheap "coarse(ts)" capture point to read a
+        ## dedicated "cur" snapshot from the way gnn_correction_cur is above.
+        local_correction_nbs = getattr(self.model.motion_bases, "last_local_correction", None)
+        local_gnn_correction_reg_loss = torch.tensor(0.0, device=device)
+        local_gnn_correction_smooth_loss = torch.tensor(0.0, device=device)
+        local_gnn_anchor_loss_value = torch.tensor(0.0, device=device)
+        if local_correction_nbs is not None:
+            n = ts_clamp.shape[0]
+            N_local = local_correction_nbs["omega"].shape[0]
+            # (N, 3n, 3) -> (N, n, 3, 3): axis=-2 becomes the (t-1, t, t+1) triplet.
+            local_omega_triplet = local_correction_nbs["omega"].reshape(N_local, 3, n, 3).permute(0, 2, 1, 3)
+            local_delta_t_triplet = local_correction_nbs["delta_t"].reshape(N_local, 3, n, 3).permute(0, 2, 1, 3)
+            omega_local_cur = local_omega_triplet[:, :, 1]  # (N, n, 3), the ts_clamp (== ts) frame
+            delta_t_local_cur = local_delta_t_triplet[:, :, 1]
+
+            local_gnn_correction_reg_loss = gnn_correction_magnitude_loss(omega_local_cur, delta_t_local_cur)
+            loss += local_gnn_correction_reg_loss * self.losses_cfg.w_local_gnn_correction_reg
+
+            local_gnn_correction_smooth_loss = gnn_correction_smoothness_loss(
+                local_omega_triplet, local_delta_t_triplet
+            )
+            loss += local_gnn_correction_smooth_loss * self.losses_cfg.w_local_gnn_correction_smooth
+
+            if self.losses_cfg.w_local_gnn_anchor > 0:
+                coefs_all_local = self.model.fg.get_coefs()
+                cluster_ids_all_local = self.model.fg.get_cluster_ids().reshape(-1).long()
+                corrected_local, predicted_local = self.model.motion_bases.local_gnn_anchor_terms(
+                    ts, coefs_all_local, cluster_ids_all_local
+                )
+                local_gnn_anchor_loss_value = local_gnn_anchor_loss(corrected_local, predicted_local)
+                loss += local_gnn_anchor_loss_value * self.losses_cfg.w_local_gnn_anchor
+
         ## Boundary gap loss: OFF by default (self.losses_cfg.w_boundary_gap
         ## defaults to 0.0) -- correction magnitude is now learned directly
         ## from the render loss (RGB/depth/mask/track, via compute_transforms's
@@ -1525,6 +1639,9 @@ class Trainer:
             "train/edge_correction_reg_loss": edge_correction_reg_loss.item(),
             "train/edge_correction_smooth_loss": edge_correction_smooth_loss.item(),
             "train/edge_boundary_gap_loss": edge_boundary_gap_loss_value.item(),
+            "train/local_gnn_correction_reg_loss": local_gnn_correction_reg_loss.item(),
+            "train/local_gnn_correction_smooth_loss": local_gnn_correction_smooth_loss.item(),
+            "train/local_gnn_anchor_loss": local_gnn_anchor_loss_value.item(),
             "train/joint_anchor_loss": joint_anchor_loss_value.item(),
             "train/num_gaussians": self.model.num_gaussians,
             "train/num_fg_gaussians": self.model.num_fg_gaussians,
@@ -1741,6 +1858,29 @@ class Trainer:
                     f"[edge-patch-membership] refreshed at {step=}: "
                     f"num_fg_gaussians={mb.num_fg_gaussians.item()} "
                     f"membership_rows={mb.row_gaussian_idx.numel()}"
+                )
+
+        # flow3d/graph_relative_local_attention.py: same rationale as the two
+        # refreshes above -- hard node membership and the top-k RBF blend
+        # candidate set are both keyed by canonical Gaussian identity, so
+        # they go stale whenever densify/cull resizes/reorders the
+        # foreground array. Expensive (nearest-neighbor search per cluster)
+        # -- only run here on an actual count change; the SEPARATE periodic
+        # refresh in compute_losses (every --local-gnn-refresh-every steps)
+        # covers staleness from canonical means simply drifting under
+        # training with no count change at all.
+        if isinstance(self.model.motion_bases, LocalRelativeAttentionGraphCorrectedScalableMotionBases):
+            mb = self.model.motion_bases
+            if mb.gnn.hard_member_node_id.shape[0] != self.model.fg.num_gaussians:
+                mb.refresh_local_node_assignment(
+                    self.model.fg.params["means"].detach(),
+                    self.model.fg.get_cluster_ids().reshape(-1).long(),
+                    self.model.fg.get_coefs().detach(),
+                )
+                guru.info(
+                    f"[local-gnn-assignment] refreshed at {step=} (Gaussian count changed): "
+                    f"num_fg_gaussians={self.model.fg.num_gaussians} "
+                    f"num_nodes={mb.gnn.num_nodes}"
                 )
 
     @torch.no_grad()
@@ -2377,9 +2517,24 @@ class Trainer:
                 # GNN params (e.g. "motion_bases.gnn.encoder.0.weight") aren't a
                 # "part.params.field" leaf, so they're not in lr_dict -- give
                 # them their own fixed-lr param group instead.
-                lr = self.optim_cfg.gnn_lr
+                # flow3d/graph_relative_local_attention.py's local-node GNN is a
+                # separate, independent correction path with its own LR.
+                lr = (
+                    self.optim_cfg.local_gnn_lr
+                    if isinstance(
+                        self.model.motion_bases,
+                        LocalRelativeAttentionGraphCorrectedScalableMotionBases,
+                    )
+                    else self.optim_cfg.gnn_lr
+                )
             else:
                 lr = lr_dict[part][field]
+
+                if (
+                    part == "motion_bases"
+                    and hasattr(self.model.motion_bases, "last_correction")
+                ):
+                    lr *= self.optim_cfg.gnn_base_motion_lr_scale
             optim = torch.optim.Adam([{"params": params, "lr": lr, "name": name}])
 
             if "scales" in name:
